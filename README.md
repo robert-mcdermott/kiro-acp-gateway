@@ -528,9 +528,9 @@ docs/          design notes
 legacy/        the original proof-of-concept scripts (kept for reference)
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design,
 [docs/KIRO_ACP_NOTES.md](docs/KIRO_ACP_NOTES.md) for what Kiro's ACP implementation
-actually does on the wire.
+actually does on the wire, and [docs/ROADMAP.md](docs/ROADMAP.md) for planned work.
 
 ## License
 
