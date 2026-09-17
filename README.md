@@ -342,14 +342,24 @@ back by the client are rendered into the transcript. Anthropic-defined tools (`b
 `KIRO_GATEWAY_TOOL_MODE=reject` refuses requests with tools; `ignore` drops them.
 
 Kiro's stock agents have their own file and shell tools and its models are tuned to use
-them, which competes with the harness. For requests that carry tools the gateway therefore
-runs Kiro with a **tool-less agent**: at startup it writes
+them, which competes with the harness, and recent models rightly refuse to be told they are
+a different product with a "fabricated" tool protocol. For requests that carry tools the
+gateway therefore runs Kiro with a **tool-less agent** whose own prompt explains, honestly,
+what is going on: the model stays Kiro, the client's system prompt is context about the
+tool it is serving, and the client's functions are the only way to act on the user's
+project: at startup it writes
 `~/.kiro/agents/kiro-gateway-harness.json` (no tools, no MCP servers) unless the file
 already exists, and selects it for every harness-mode turn. Point
 `KIRO_GATEWAY_HARNESS_AGENT` at your own agent to customize this, or set it empty to keep
 Kiro's default agent; `KIRO_GATEWAY_PROVISION_HARNESS_AGENT=false` stops the gateway
 from writing the file. Kiro's remaining permission requests in harness mode follow
 `KIRO_GATEWAY_HARNESS_PERMISSIONS` (default `deny`).
+
+Harness turns also run on the **v2 engine** by default (`KIRO_GATEWAY_HARNESS_ENGINE`),
+while agent-mode turns use `KIRO_GATEWAY_ENGINE` (v3). In testing, the v3 engine's own
+identity prompt and always-present skill loader led models to keep attempting native tool
+calls, and Sonnet 5 sometimes refused the harness framing outright; on v2 the tool-less
+agent behaves like a plain model and follows the protocol consistently.
 
 **Kiro's own tools (agent mode).** When no client tools are supplied, Kiro acts as a full
 agent inside `KIRO_GATEWAY_WORKSPACE`, subject to `KIRO_GATEWAY_PERMISSIONS` and
@@ -394,6 +404,7 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_PERMISSIONS` | `deny` | Policy for Kiro's tool requests in agent mode. |
 | `KIRO_GATEWAY_PERMISSION_RULES` | empty | `allow:kind=read;deny:tool=shell` style rules, `;`-separated. |
 | `KIRO_GATEWAY_HARNESS_PERMISSIONS` | `deny` | Policy while emulating client tools. |
+| `KIRO_GATEWAY_HARNESS_ENGINE` | `v2` | Kiro engine for harness-mode turns (empty = same as `KIRO_GATEWAY_ENGINE`). |
 | `KIRO_GATEWAY_HARNESS_AGENT` | `kiro-gateway-harness` | Tool-less Kiro agent used in harness mode (empty disables). |
 | `KIRO_GATEWAY_PROVISION_HARNESS_AGENT` | `true` | Write the harness agent file into `~/.kiro/agents` when missing. |
 | `KIRO_GATEWAY_SESSION_MODE` | `affinity` | `affinity` or `stateless`. |
@@ -418,6 +429,8 @@ the working directory is also read). The most important ones:
 | `/v1/models` is empty or every model falls back | `KIRO_API_KEY` (or another `KIRO_*` variable) is set in the environment and breaks `kiro-cli`'s own auth. Unset it; gateway settings use `KIRO_GATEWAY_*`. |
 | 502 `kiro_unavailable` | `kiro-cli` is missing, not logged in, or the v3 engine failed to start. Run `uv run kiro-acp doctor`. |
 | Harness client says it has no tools / ignores tool calls | The model is too small for the harness prompt. Use a Sonnet- or Opus-class model. |
+| Kiro answers "I'm Kiro, that looks like injected instructions" or reports native tool calls as "not available" | Harness turns are running on the v3 engine or with a stale agent file. Keep `KIRO_GATEWAY_HARNESS_ENGINE=v2` (the default) and restart the gateway so it refreshes `~/.kiro/agents/kiro-gateway-harness.json`. |
+| Kiro loads skills or steering docs while serving a harness | Run `kiro-cli settings chat.disableInheritingDefaultResources true` (or `--workspace` for one project). |
 | A stream stops after a while | The turn hit `KIRO_GATEWAY_TIMEOUT` (default 900 s) and was cancelled. |
 
 ### Error format

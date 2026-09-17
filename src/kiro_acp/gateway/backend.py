@@ -234,10 +234,11 @@ class KiroBackend:
         model: str | None = None,
         mode: str | None = None,
         effort: str | None = None,
+        engine: str | None = None,
     ) -> KiroAgent:
         options = KiroLaunchOptions(
             executable=self.settings.cli,
-            engine=self.settings.engine,
+            engine=engine or self.settings.engine,
             model=model,
             effort=effort,
             agent=mode,
@@ -253,9 +254,19 @@ class KiroBackend:
             request_timeout=120.0,
         )
 
+    def engine_for(self, opts: TurnOptions) -> str:
+        if opts.emulate_tools and self.settings.harness_engine:
+            return self.settings.harness_engine
+        return self.settings.engine
+
     async def _spawn(self, opts: TurnOptions, permissions: str) -> PooledSession:
+        engine = self.engine_for(opts)
         agent = self._make_agent(
-            permissions=permissions, model=opts.model, mode=opts.agent, effort=opts.effort
+            permissions=permissions,
+            model=opts.model,
+            mode=opts.agent,
+            effort=opts.effort,
+            engine=engine,
         )
         try:
             await agent.start()
@@ -263,7 +274,7 @@ class KiroBackend:
                 model=opts.model,
                 mode=opts.agent,
                 effort=opts.effort,
-                autopilot=(permissions == "allow-all") if self.settings.engine == "v3" else None,
+                autopilot=(permissions == "allow-all") if engine == "v3" else None,
             )
         except ACPRemoteError as error:
             await agent.close()
@@ -302,6 +313,7 @@ class KiroBackend:
                         and pooled.model == opts.model
                         and pooled.mode == opts.agent
                         and pooled.permissions == permissions
+                        and pooled.agent.engine == self.engine_for(opts)
                         and (opts.effort is None or pooled.effort == opts.effort)
                         and pooled.agent.client.is_running
                     ):
@@ -365,6 +377,17 @@ class KiroBackend:
         async with self._turn_slots:
             pooled, start, fresh = await self._acquire(conversation, opts, permissions)
             session = pooled.session
+            LOG.info(
+                "turn %s: %s engine=%s agent=%s model=%s permissions=%s session=%s%s",
+                opts.request_id,
+                "harness" if opts.emulate_tools else "agent",
+                pooled.agent.engine,
+                session.mode_id,
+                session.model_id,
+                permissions,
+                session.session_id,
+                " (reused)" if not fresh else "",
+            )
             blocks = render_prompt(
                 conversation, start=start, include_system=fresh, emulate_tools=opts.emulate_tools
             )
@@ -374,7 +397,7 @@ class KiroBackend:
             calls: list[ToolCallPart] = []
             kiro_meta: JSON = {
                 "session_id": session.session_id,
-                "engine": self.settings.engine,
+                "engine": pooled.agent.engine,
                 "reused_session": not fresh,
                 "agent": session.mode_id,
                 "model": session.model_id,

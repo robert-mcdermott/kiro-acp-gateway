@@ -87,12 +87,24 @@ Kiro is an agent with its own tools; ACP has no way to inject a client's tool sc
 gateway therefore prepends a protocol description listing the client's tools and asks the
 model to emit tool calls as tagged JSON blocks. The parser is incremental and tolerant:
 partial tags at chunk boundaries are held back, fenced JSON is accepted, invalid JSON is
-passed through as text. Prompting alone is not enough: Kiro's stock agents have native
-tools and the models use them in preference to the emulated protocol. Harness-mode turns
-therefore run under a tool-less Kiro agent (`harness_agent.py` provisions
-`~/.kiro/agents/kiro-gateway-harness.json` with `"tools": []`), and any remaining
-permission requests default to `deny` (`harness_permissions`), so the harness remains the
-only actor on the workspace.
+passed through as text. Prompting alone is not enough, for two reasons found in testing:
+
+1. Kiro's stock agents have native tools and the models use them in preference to the
+   emulated protocol. Harness-mode turns therefore run under a tool-less Kiro agent
+   (`harness_agent.py` provisions `~/.kiro/agents/kiro-gateway-harness.json` with
+   `"tools": []`), and remaining permission requests default to `deny`.
+2. Newer models (Sonnet 5) treat a block that tells them to become "Claude Code" with a
+   tagged tool protocol as prompt injection and refuse, even when it arrives via the agent
+   prompt. The harness agent's own `prompt` therefore never asks the model to change
+   identity: it explains that the gateway is real infrastructure, that the client's system
+   prompt is context about the tool being served, and that the client's functions are the
+   only way to act on the user's project. The gateway renders each request with explicit
+   `<operator_instructions>`, `<tools>`, and `<conversation>` /
+   `<message role=...>` / `<tool_result>` tags so the structure is unambiguous.
+3. Even so, the v3 engine's identity prompt and built-in skill loader make models keep
+   attempting native tool calls (which fail) and Sonnet 5 refused the framing in one of two
+   trials; the v2 engine with the same agent produced zero native attempts. Harness turns
+   therefore default to v2 (`harness_engine`), independent of the agent-mode engine.
 
 ## Testing
 

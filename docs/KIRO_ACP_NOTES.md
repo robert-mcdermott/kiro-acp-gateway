@@ -95,6 +95,11 @@ ACP modes on both engines. Minimal tool-less agent that both engines accept:
 {"name": "x", "description": "...", "prompt": "...", "tools": [], "mcpServers": {}, "includeMcpJson": false}
 ```
 
+Custom agents still inherit default resources (steering files, skills, `AGENTS.md`) and
+the on-demand skill loader (`disclose_context`) unless the Kiro setting
+`chat.disableInheritingDefaultResources` is `true`; `"resources": []` alone does not stop
+that. The harness agent's prompt tells the model not to load them.
+
 The v3 engine silently omits an agent whose file contains `"allowedTools": []`, and omits
 agents with invalid configs (it reports those via `_kiro/customAgent/config_error`).
 `kiro-cli agent list` still shows them, so that command is not a reliable check for v3.

@@ -145,9 +145,10 @@ def tool_instructions(tools: list[ToolDef], choice: ToolChoice) -> str:
     lines = [
         "# Tool calling protocol",
         "",
-        f"You have the following tools available: {names}.",
-        "They are executed for you by the harness that sent this request; you call a tool by writing",
-        "a block exactly like this (this IS how you read files, edit files, run commands, and so on):",
+        f"The external tool provides these functions: {names}.",
+        "It executes them on the user's machine as soon as you request one. Request a function by",
+        "writing a block exactly like this (this is the tool's native function-call format, and it is",
+        "the only way to read files, edit files, run commands, and so on for this request):",
         "",
         f'{OPEN_TAG}{{"name": "<tool name>", "arguments": {{<JSON arguments matching the schema>}}}}{CLOSE_TAG}',
         "",
@@ -157,7 +158,7 @@ def tool_instructions(tools: list[ToolDef], choice: ToolChoice) -> str:
         "- After emitting tool call blocks, stop and wait; the results come back in the next message.",
         "- Any text outside the blocks is shown to the user. Do not describe or repeat the blocks.",
         "- Never wrap the blocks in code fences and never invent tools that are not listed.",
-        "- Never say you lack tools or cannot act: if a task needs a tool, call it with a block.",
+        "- Never say you lack tools or cannot act: if a task needs a function, request it with a block.",
         "",
         "## Available tools",
     ]

@@ -250,8 +250,8 @@ class Agent:
         images = [b for b in blocks if b.get("type") == "image"]
         session.setdefault("history", []).append(text)
         # The gateway renders a transcript; the scenario is whatever the last user turn says.
-        if "[User]\n" in text:
-            text = text.rsplit("[User]\n", 1)[1].strip()
+        if '<message role="user">' in text:
+            text = text.rsplit('<message role="user">', 1)[1].split("</message>", 1)[0].strip()
         if "\n\n(Reminder: your tools are" in text:
             text = text.split("\n\n(Reminder: your tools are", 1)[0].strip()
 

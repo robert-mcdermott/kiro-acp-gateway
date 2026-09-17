@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     harness_permissions: PermissionMode = Field(
         default="deny", description="Policy while emulating client-defined tools (harness mode)"
     )
+    harness_engine: str | None = Field(
+        default="v2",
+        description="Kiro engine for harness-mode turns (client-defined tools); empty = same as engine. "
+        "v2 follows the emulated tool protocol far more reliably than v3.",
+    )
     harness_agent: str | None = Field(
         default="kiro-gateway-harness",
         description="Tool-less Kiro agent selected while emulating client tools (empty = keep the default agent)",
@@ -126,9 +131,11 @@ class Settings(BaseSettings):
             )
         return value
 
-    @field_validator("engine", mode="before")
+    @field_validator("engine", "harness_engine", mode="before")
     @classmethod
-    def _normalize_engine(cls, value: str) -> str:
+    def _normalize_engine(cls, value: str | None) -> str | None:
+        if value is None or str(value).strip() == "":
+            return None
         value = str(value).strip().lower()
         if value not in ("v1", "v2", "v3"):
             raise ValueError("engine must be v3, v2, or v1")

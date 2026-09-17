@@ -136,6 +136,11 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
     async def health():
         return backend.health()
 
+    @app.api_route("/api/hello", methods=["GET", "HEAD"])
+    async def api_hello():
+        # Claude Code probes this path to check connectivity.
+        return {"ok": True}
+
     @app.get("/")
     async def index():
         return {

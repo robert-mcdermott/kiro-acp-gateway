@@ -15,8 +15,10 @@ from tests.conftest import fake_agent_command
 class FakeKiroBackend(KiroBackend):
     """Backend that launches the scripted fake agent instead of kiro-cli."""
 
-    def _make_agent(self, *, permissions, model=None, mode=None, effort=None):
-        agent = super()._make_agent(permissions=permissions, model=model, mode=mode, effort=effort)
+    def _make_agent(self, *, permissions, model=None, mode=None, effort=None, engine=None):
+        agent = super()._make_agent(
+            permissions=permissions, model=model, mode=mode, effort=effort, engine=engine
+        )
         agent.options.raw_command = fake_agent_command()
         agent.client.command = agent.options.command()
         return agent

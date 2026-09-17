@@ -17,34 +17,41 @@ from kiro_acp.gateway.conversation import (
 from kiro_acp.gateway.toolcalls import render_tool_call, tool_instructions, tool_reminder
 
 HARNESS_PREAMBLE = (
-    "You are serving as the language model behind an API. Reply as the assistant to the conversation "
-    "below. Output only the assistant's next reply: no role labels, no commentary about this transcript."
+    "This is an API request relayed by kiro-gateway from an external coding tool. Answer the "
+    "conversation below on the tool's behalf. Output only your reply: no role labels, no tags, "
+    "no commentary about this request's structure."
 )
 
 TRANSCRIPT_NOTE = (
-    "The conversation so far is reproduced here as a transcript because this session has no memory "
-    "of it. Treat it as the real conversation history."
+    "The conversation so far is reproduced here because this session has no memory of it. Treat it "
+    "as the real conversation history."
 )
 
 
 def build_system_text(conversation: Conversation, *, emulate_tools: bool) -> str:
     sections: list[str] = [HARNESS_PREAMBLE]
     if conversation.system.strip():
-        sections.append("# Operator instructions\n\n" + conversation.system.strip())
+        sections.append(
+            "<operator_instructions>\n" + conversation.system.strip() + "\n</operator_instructions>"
+        )
     if emulate_tools and conversation.tools and conversation.tool_choice.mode != "none":
-        sections.append(tool_instructions(conversation.tools, conversation.tool_choice))
+        sections.append(
+            "<tools>\n"
+            + tool_instructions(conversation.tools, conversation.tool_choice)
+            + "\n</tools>"
+        )
     if conversation.json_output is not None:
         note = "Respond with a single JSON value and nothing else (no prose, no code fences)."
         if conversation.json_output.schema:
             note += "\nThe JSON must conform to this JSON Schema:\n" + json.dumps(
                 conversation.json_output.schema, ensure_ascii=False
             )
-        sections.append("# Output format\n\n" + note)
+        sections.append("<output_format>\n" + note + "\n</output_format>")
     return "\n\n".join(sections)
 
 
 def render_message(message: Message) -> str:
-    """Render one message as transcript text (images are attached separately)."""
+    """Render one message as a tagged transcript entry (images are attached separately)."""
     if message.role == "assistant":
         chunks: list[str] = []
         text = message.text().strip()
@@ -52,22 +59,28 @@ def render_message(message: Message) -> str:
             chunks.append(text)
         for call in message.tool_calls:
             chunks.append(render_tool_call(call))
-        return "[Assistant]\n" + ("\n".join(chunks) if chunks else "(empty)")
+        body = "\n".join(chunks) if chunks else "(empty)"
+        return f'<message role="assistant">\n{body}\n</message>'
     if message.role == "tool" or message.tool_results:
         blocks = []
         for result in message.tool_results:
-            label = f"[Tool result for {result.name or 'tool'} call {result.call_id}"
-            label += " (error)]" if result.is_error else "]"
-            blocks.append(label + "\n" + (result.content.strip() or "(no output)"))
+            attrs = f' call_id="{result.call_id}"'
+            if result.name:
+                attrs += f' name="{result.name}"'
+            if result.is_error:
+                attrs += ' error="true"'
+            blocks.append(
+                f"<tool_result{attrs}>\n{result.content.strip() or '(no output)'}\n</tool_result>"
+            )
         text = message.text().strip()
         if text:
-            blocks.append("[User]\n" + text)
-        return "\n\n".join(blocks)
-    label = "[User]" if not message.name else f"[User ({message.name})]"
+            blocks.append(f'<message role="user">\n{text}\n</message>')
+        return "\n".join(blocks)
+    attrs = f' name="{message.name}"' if message.name else ""
     body = message.text().strip()
     if message.images and not body:
         body = "(see attached image)"
-    return f"{label}\n{body}"
+    return f'<message role="user"{attrs}>\n{body}\n</message>'
 
 
 def render_prompt(
@@ -90,19 +103,24 @@ def render_prompt(
     if include_system and start > 0:
         # Fresh session but the client already has history: replay it as a transcript.
         start = 0
-    if start == 0 and len(messages) > 1 and include_system:
-        sections.append("# Conversation\n\n" + TRANSCRIPT_NOTE)
+    rendered: list[str] = []
     for message in messages[start:]:
         for image in message.images:
             blocks.append(image_block(image.data_base64, image.mime_type))
-        sections.append(render_message(message))
+        rendered.append(render_message(message))
+    note = (TRANSCRIPT_NOTE + "\n") if (start == 0 and len(messages) > 1 and include_system) else ""
+    sections.append("<conversation>\n" + note + "\n".join(rendered) + "\n</conversation>")
     if emulate_tools and conversation.tools and conversation.tool_choice.mode != "none":
         sections.append(tool_reminder(conversation.tools))
     text = "\n\n".join(section for section in sections if section)
     if text:
         blocks.append(text_block(text))
     if not blocks:
-        blocks.append(text_block("[User]\n(empty message)"))
+        blocks.append(
+            text_block(
+                '<conversation>\n<message role="user">\n(empty message)\n</message>\n</conversation>'
+            )
+        )
     return blocks
 
 
