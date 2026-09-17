@@ -84,6 +84,19 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
             supplied = auth[7:].strip()
         supplied = supplied or request.headers.get("x-api-key")
         if supplied not in keys:
+            if supplied and supplied.startswith("sk-ant-oat"):
+                LOG.warning(
+                    "401 on %s: the client sent a Claude account OAuth token instead of the gateway key. "
+                    "Claude Code prefers its login over ANTHROPIC_API_KEY; set "
+                    "ANTHROPIC_AUTH_TOKEN=<gateway key> or run `claude /logout` (see README, Troubleshooting).",
+                    request.url.path,
+                )
+            elif supplied:
+                LOG.warning(
+                    "401 on %s: credential does not match KIRO_GATEWAY_API_KEY", request.url.path
+                )
+            else:
+                LOG.warning("401 on %s: no Authorization or x-api-key header", request.url.path)
             anthropic_client = (
                 "anthropic-version" in request.headers or "x-api-key" in request.headers
             )

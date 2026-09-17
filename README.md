@@ -191,7 +191,8 @@ Every option has an environment default: `KIRO_ACP_CLI`, `KIRO_ACP_ENGINE`,
 ### Start it
 
 ```bash
-export KIRO_GATEWAY_WORKSPACE="$PWD"              # the only directory Kiro may work in
+export KIRO_GATEWAY_WORKSPACE="$PWD"              # the only directory Kiro's own tools may touch
+                                                  # (harness clients like Claude Code work in their own cwd)
 export KIRO_GATEWAY_API_KEY="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export KIRO_GATEWAY_PERMISSIONS=deny              # deny | allow-once | allow-always | allow-all
 uv run kiro-gateway --port 8000
@@ -254,9 +255,23 @@ print(message.content[0].text)
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=your-gateway-key
+export ANTHROPIC_AUTH_TOKEN=your-gateway-key         # see note below
 export ANTHROPIC_MODEL=claude-sonnet-4.6            # optional: any Kiro model id
 claude
 ```
+
+> **Why both variables?** When Claude Code is logged in to a Claude account it sends its
+> account OAuth token as `Authorization: Bearer ...` and ignores `ANTHROPIC_API_KEY`, so the
+> gateway answers `401 invalid x-api-key`. Setting `ANTHROPIC_AUTH_TOKEN` to the gateway
+> key makes Claude Code send that key as the bearer token instead. Alternatively, keep a
+> separate Claude Code profile with no login for gateway use:
+>
+> ```bash
+> CLAUDE_CONFIG_DIR=~/.claude-kiro ANTHROPIC_BASE_URL=http://127.0.0.1:8000 \
+>   ANTHROPIC_API_KEY=your-gateway-key claude
+> ```
+>
+> The gateway logs a hint whenever it receives a Claude OAuth token instead of its key.
 
 Claude Code sends its tools (`Bash`, `Edit`, `Read`, ...) with every request. The gateway
 describes them to Kiro and turns Kiro's replies into real `tool_use` blocks, so Claude Code
@@ -336,8 +351,8 @@ Kiro's default agent; `KIRO_GATEWAY_PROVISION_HARNESS_AGENT=false` stops the gat
 from writing the file. Kiro's remaining permission requests in harness mode follow
 `KIRO_GATEWAY_HARNESS_PERMISSIONS` (default `deny`).
 
-**Kiro's own tools.** When no client tools are supplied, Kiro acts as a full agent inside
-`KIRO_GATEWAY_WORKSPACE`, subject to `KIRO_GATEWAY_PERMISSIONS` and
+**Kiro's own tools (agent mode).** When no client tools are supplied, Kiro acts as a full
+agent inside `KIRO_GATEWAY_WORKSPACE`, subject to `KIRO_GATEWAY_PERMISSIONS` and
 `KIRO_GATEWAY_PERMISSION_RULES` (same rule syntax as the CLI). Its tool activity is
 surfaced as reasoning (`reasoning_content`, Responses `reasoning` items, Anthropic
 `thinking` blocks) by default; `KIRO_GATEWAY_TOOL_ACTIVITY=text` puts it in the answer and
@@ -366,7 +381,7 @@ the working directory is also read). The most important ones:
 
 | Variable | Default | Description |
 |---|---|---|
-| `KIRO_GATEWAY_WORKSPACE` | current directory | Directory Kiro operates in. Clients cannot change it. |
+| `KIRO_GATEWAY_WORKSPACE` | current directory | Directory Kiro's own tools operate in (agent mode). Requests cannot change it. Harness clients such as Claude Code run their own tools in their own directory and are unaffected. |
 | `KIRO_GATEWAY_API_KEY` | empty | Key required on `/v1/*`. Empty means no authentication. |
 | `KIRO_GATEWAY_HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address. |
 | `KIRO_GATEWAY_CLI` | `kiro-cli` | Kiro executable. |
@@ -394,6 +409,16 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_SERVE_FS` / `SERVE_TERMINAL` | `false` | Offer client file-system / terminal capabilities to Kiro. |
 | `KIRO_GATEWAY_DEBUG_ACP` | `false` | Log raw ACP traffic. |
 | `KIRO_GATEWAY_LOG_LEVEL` | `info` | Log level. |
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Claude Code: `401 invalid x-api-key`; gateway log mentions an OAuth token | Claude Code is sending its account login instead of the gateway key. Set `ANTHROPIC_AUTH_TOKEN` to the gateway key too, or use a separate `CLAUDE_CONFIG_DIR` (see above). |
+| `/v1/models` is empty or every model falls back | `KIRO_API_KEY` (or another `KIRO_*` variable) is set in the environment and breaks `kiro-cli`'s own auth. Unset it; gateway settings use `KIRO_GATEWAY_*`. |
+| 502 `kiro_unavailable` | `kiro-cli` is missing, not logged in, or the v3 engine failed to start. Run `uv run kiro-acp doctor`. |
+| Harness client says it has no tools / ignores tool calls | The model is too small for the harness prompt. Use a Sonnet- or Opus-class model. |
+| A stream stops after a while | The turn hit `KIRO_GATEWAY_TIMEOUT` (default 900 s) and was cancelled. |
 
 ### Error format
 
