@@ -207,7 +207,137 @@ uv run kiro-gateway --port 8000
 
 `kiro-gateway --print-config` shows the effective configuration. `GET /health` is
 unauthenticated; every `/v1/*` route requires the key as `Authorization: Bearer <key>` or
-`x-api-key: <key>` when one is configured.
+`x-api-key: <key>` when one is configured. Settings can also live in a `.env` file in the
+directory you start the gateway from (see `.env.example`), and the most common ones have
+flags: `--port`, `--workspace`, `--engine`, `--permissions`, `--api-key`,
+`--default-model`, `--session-mode`, `--max-concurrency`, `--log-level`, `--debug-acp`.
+
+### Connecting any client: the three things it needs
+
+Every client, script, or coding harness needs exactly three values:
+
+| Value | What to use | Notes |
+|---|---|---|
+| Base URL | `http://127.0.0.1:8000/v1` for OpenAI-style clients, `http://127.0.0.1:8000` for Anthropic-style clients (they add `/v1/messages` themselves) | Both prefixes are also served under `/openai/v1` and `/anthropic/v1`. |
+| API key | the value of `KIRO_GATEWAY_API_KEY` | Sent as `Authorization: Bearer <key>` or `x-api-key: <key>`. If the gateway has no key configured, any value is accepted. |
+| Model id | any id from `GET /v1/models` (or `uv run kiro-acp models`), e.g. `claude-sonnet-4.6`, `gpt-5.6-luna` | Hyphenated and dated forms (`claude-sonnet-4-6-20260101`) are normalised; unknown names fall back to the default model unless `KIRO_GATEWAY_MODEL_FALLBACK=false`. |
+
+Nothing else is required on the client side. Optional per-request headers:
+`X-Kiro-Effort` (`low|medium|high|max`), `X-Kiro-Agent` (a Kiro agent for agent mode),
+`X-Kiro-Workspace` (a directory allowed by `KIRO_GATEWAY_ALLOWED_WORKSPACES`), and
+`X-Kiro-Permissions` (when `KIRO_GATEWAY_ALLOW_PERMISSION_OVERRIDE=true`). Effort can also
+be set in the body (`reasoning_effort`, `reasoning.effort`, `output_config.effort`).
+
+Which of the two modes a request lands in depends only on whether it sends `tools`
+(see *Two modes* below): scripts that want Kiro to act as an agent inside
+`KIRO_GATEWAY_WORKSPACE` send none; coding harnesses send theirs and run them locally.
+
+### Use it from curl
+
+```bash
+export KIRO_GATEWAY_URL=http://127.0.0.1:8000
+export KIRO_GATEWAY_KEY=your-gateway-key
+
+# OpenAI Chat Completions
+curl -s "$KIRO_GATEWAY_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $KIRO_GATEWAY_KEY" -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet-4.6", "messages": [{"role": "user", "content": "Say hello in five words."}]}'
+
+# OpenAI Responses, streamed (SSE)
+curl -sN "$KIRO_GATEWAY_URL/v1/responses" \
+  -H "Authorization: Bearer $KIRO_GATEWAY_KEY" -H "Content-Type: application/json" \
+  -d '{"model": "gpt-5.6-luna", "input": "List three uses for a gateway like this.", "stream": true}'
+
+# Anthropic Messages
+curl -s "$KIRO_GATEWAY_URL/v1/messages" \
+  -H "x-api-key: $KIRO_GATEWAY_KEY" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet-4.6", "max_tokens": 1024, "messages": [{"role": "user", "content": "Say hello in five words."}]}'
+
+# Agent mode in a specific project (requires KIRO_GATEWAY_ALLOWED_WORKSPACES to match)
+curl -s "$KIRO_GATEWAY_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $KIRO_GATEWAY_KEY" -H "Content-Type: application/json" \
+  -H "X-Kiro-Workspace: /Users/me/code/project-b" -H "X-Kiro-Effort: high" \
+  -d '{"model": "claude-opus-4.8", "messages": [{"role": "user", "content": "Find and fix the failing test."}]}'
+
+curl -s "$KIRO_GATEWAY_URL/v1/models" -H "Authorization: Bearer $KIRO_GATEWAY_KEY"   # model ids
+curl -s "$KIRO_GATEWAY_URL/health"                                                    # no key needed
+```
+
+### Use it from Python with `requests`
+
+No SDK needed. The response bodies are the standard OpenAI / Anthropic shapes plus a
+`kiro` object (session id, credits, context usage, Kiro's own tool calls in agent mode).
+
+```python
+import json
+import requests
+
+GATEWAY = "http://127.0.0.1:8000"
+HEADERS = {"Authorization": "Bearer your-gateway-key", "Content-Type": "application/json"}
+
+# Non-streaming chat completion
+r = requests.post(
+    f"{GATEWAY}/v1/chat/completions",
+    headers=HEADERS,
+    json={
+        "model": "claude-sonnet-4.6",
+        "messages": [
+            {"role": "system", "content": "You are a terse release-notes writer."},
+            {"role": "user", "content": "Summarize the last commit in one line."},
+        ],
+        "reasoning_effort": "low",           # optional: low | medium | high | max
+    },
+    timeout=900,                             # Kiro turns can be long; match KIRO_GATEWAY_TIMEOUT
+)
+r.raise_for_status()
+body = r.json()
+print(body["choices"][0]["message"]["content"])
+print("credits used:", body["kiro"]["credits"], "context:", body["kiro"].get("contextUsagePercentage"))
+
+# Streaming chat completion (Server-Sent Events)
+with requests.post(
+    f"{GATEWAY}/v1/chat/completions",
+    headers=HEADERS,
+    json={"model": "gpt-5.6-luna", "messages": [{"role": "user", "content": "Count to five."}], "stream": True},
+    stream=True,
+    timeout=900,
+) as stream:
+    for line in stream.iter_lines():
+        if not line or not line.startswith(b"data: "):
+            continue                          # keepalive comments and blank lines
+        data = line[len(b"data: "):]
+        if data == b"[DONE]":
+            break
+        delta = json.loads(data)["choices"][0]["delta"]
+        print(delta.get("content", ""), end="", flush=True)
+print()
+
+# Anthropic Messages with structured output validated against a schema
+r = requests.post(
+    f"{GATEWAY}/v1/messages",
+    headers={"x-api-key": "your-gateway-key", "anthropic-version": "2023-06-01"},
+    json={
+        "model": "claude-sonnet-4.6",
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "Classify this commit message: 'fix: null check in parser'"}],
+        "output_config": {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"kind": {"type": "string"}, "scope": {"type": "string"}},
+                    "required": ["kind"],
+                },
+            }
+        },
+    },
+    timeout=900,
+)
+print(json.loads(r.json()["content"][0]["text"]), r.json()["kiro"]["schema_valid"])
+```
+
+Errors come back with the HTTP status and body described under *Error format*; treat
+`429` and `503` as retryable (they carry `Retry-After`) and `4xx` otherwise as your bug.
 
 ### Endpoints
 
@@ -243,6 +373,12 @@ for event in stream:
         print(event.delta, end="", flush=True)
 ```
 
+Function calling from a script works the same as against OpenAI: pass `tools`, run the
+returned `tool_calls` yourself, and send the results back as `tool` messages. Note that
+any request with `tools` runs in harness mode (your script executes the tools, Kiro's own
+tools are off), and that the Kiro turn stays open until you send the results or
+`KIRO_GATEWAY_SESSION_IDLE_TTL` elapses.
+
 ### Use it from the Anthropic SDK
 
 ```python
@@ -264,8 +400,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=your-gateway-key
 export ANTHROPIC_AUTH_TOKEN=your-gateway-key         # see note below
 export ANTHROPIC_MODEL=claude-sonnet-4.6            # optional: any Kiro model id
+export ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna      # optional: Claude Code's background calls (titles, summaries)
 claude
 ```
+
+Also `/model` inside Claude Code accepts any id from `GET /v1/models`, including the
+hyphenated aliases it expects (`claude-sonnet-4-6`, `claude-opus-4-8`) and `claude-auto`.
 
 > **Why both variables?** When Claude Code is logged in to a Claude account it sends its
 > account OAuth token as `Authorization: Bearer ...` and ignores `ANTHROPIC_API_KEY`, so the
@@ -334,7 +474,13 @@ styles work:
 > `claude-sonnet-4.6` (Claude Code: multi-turn read/write task; Codex: shell command via the
 > Responses API).
 
-### Use it from OpenCode
+### Use it from OpenCode and other OpenAI-compatible harnesses
+
+Any harness with an "OpenAI-compatible provider" setting works: give it the base URL
+`http://127.0.0.1:8000/v1`, the gateway key, and a Kiro model id. Tool calling, streaming,
+and reasoning content are all supported over Chat Completions, and the Responses API is
+there for harnesses that prefer it. Custom harnesses (for example ones built on the
+Vercel AI SDK or LiteLLM) need nothing gateway-specific. OpenCode example:
 
 ```json
 {
@@ -343,11 +489,17 @@ styles work:
       "npm": "@ai-sdk/openai-compatible",
       "name": "Kiro",
       "options": {"baseURL": "http://127.0.0.1:8000/v1", "apiKey": "your-gateway-key"},
-      "models": {"claude-sonnet-4.6": {"name": "Claude Sonnet 4.6 (Kiro)"}}
+      "models": {
+        "claude-sonnet-4.6": {"name": "Claude Sonnet 4.6 (Kiro)"},
+        "gpt-5.6-luna": {"name": "GPT 5.6 Luna (Kiro)"}
+      }
     }
   }
 }
 ```
+
+Every model id you want to pick in the harness has to be listed under `models`; the ids
+come from `GET /v1/models`.
 
 ### Two modes
 
@@ -446,8 +598,9 @@ the count is an estimate. Long silent stretches (Kiro running a tool) are covere
 periodic keepalives so clients with stream watchdogs do not disconnect.
 
 **Errors.** Kiro failures are classified so SDK retry logic works: throttling and quota
-errors become `429` with `Retry-After`, model unavailable or overloaded `503`, backend
-timeouts `504`, anything else `502`.
+errors become `429` with `Retry-After`, a busy session `409`, model unavailable or
+overloaded `503`, backend timeouts `504`, auth and connection problems `502`. The full
+code table is under *Error format*.
 
 **Effort.** `reasoning_effort`, `reasoning.effort`, and `output_config.effort` map to
 Kiro's `low|medium|high|max` (`xhigh` becomes `max`). The v3 engine only exposes effort for
