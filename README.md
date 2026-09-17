@@ -501,6 +501,7 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_PERMISSION_RULES` | empty | Ordered rules: `allow:kind=read,search`, `deny:tool=shell`, or Claude Code style `allow:Bash(git status*)`, `deny:Read(/etc/*)`, `allow:mcp__server__tool`. |
 | `KIRO_GATEWAY_HARNESS_PERMISSIONS` | `deny` | Policy while emulating client tools. |
 | `KIRO_GATEWAY_HARNESS_ENGINE` | `v2` | Kiro engine for harness-mode turns (empty = same as `KIRO_GATEWAY_ENGINE`). |
+| `KIRO_GATEWAY_HARNESS_WORKSPACE` | *(empty)* | Directory Kiro runs in for harness turns. Empty means a fresh empty scratch directory, so Kiro cannot pull the gateway workspace's README, AGENTS.md, or steering files into a harness prompt (the harness's own project is a different directory). Set a path only if you want Kiro to see one project's steering files during harness turns. |
 | `KIRO_GATEWAY_HARNESS_AGENT` | `kiro-gateway-harness` | Tool-less Kiro agent used in harness mode (empty disables). |
 | `KIRO_GATEWAY_PROVISION_HARNESS_AGENT` | `true` | Write the harness agent file into `~/.kiro/agents` when missing. |
 | `KIRO_GATEWAY_SESSION_MODE` | `affinity` | `affinity` or `stateless`. |
@@ -540,6 +541,7 @@ the working directory is also read). The most important ones:
 | Harness client says it has no tools / ignores tool calls (`emulate` mode) | The model is too small for the harness prompt. Use a Sonnet- or Opus-class model, or the default `mcp` tool mode. |
 | Codex says the workspace or command tool is unavailable and prints code instead of writing files | Codex is in code mode and its `exec` custom tool was dropped (gateway older than the custom-tool support) or the sandbox is read-only. Upgrade the gateway; for `codex exec` pass `-s workspace-write` or `--full-auto`. |
 | Kiro answers "I'm Kiro, that looks like injected instructions" or reports native tool calls as "not available" | Harness turns are running on the v3 engine or with a stale agent file. Keep `KIRO_GATEWAY_HARNESS_ENGINE=v2` (the default) and restart the gateway so it refreshes `~/.kiro/agents/kiro-gateway-harness.json`. |
+| Claude Code answers about the *gateway's* directory, or says it has no file tools, before calling any | Kiro auto-loads README/AGENTS.md/steering from its own cwd. Since harness turns now run in an empty scratch directory this needs a gateway older than the `KIRO_GATEWAY_HARNESS_WORKSPACE` setting, or that setting pointing at a project. Restart the gateway. |
 | Kiro loads skills or steering docs while serving a harness | Run `kiro-cli settings chat.disableInheritingDefaultResources true` (or `--workspace` for one project). |
 | A stream stops after a while | The turn hit `KIRO_GATEWAY_TIMEOUT` (default 900 s) and was cancelled. |
 

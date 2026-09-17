@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -248,6 +250,7 @@ class KiroBackend:
         self._models_lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
         self._warmup: asyncio.Task[None] | None = None
+        self._harness_dir: str | None = None
         self._active: set[PooledSession] = set()
         self.bridge_broker: ToolBridgeBroker | None = None
         self.started = False
@@ -266,6 +269,10 @@ class KiroBackend:
                     ensure_harness_agent(name, mcp=mcp)
                 except OSError as error:
                     LOG.warning("Could not provision harness agent %r: %s", name, error)
+        if not self.settings.harness_workspace:
+            # Harness turns: the client executes every tool, so Kiro's cwd only matters
+            # for what it auto-loads (README, AGENTS.md, steering). Give it nothing.
+            self._harness_dir = tempfile.mkdtemp(prefix="kiro-gateway-harness-")
         if self.settings.tool_mode == "mcp":
             self.bridge_broker = ToolBridgeBroker()
             await self.bridge_broker.start()
@@ -307,6 +314,9 @@ class KiroBackend:
             self._reaper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reaper
+        if self._harness_dir:
+            shutil.rmtree(self._harness_dir, ignore_errors=True)
+            self._harness_dir = None
         async with self._pool_lock:
             pooled = list(self._pool.values())
             self._pool.clear()
@@ -453,6 +463,15 @@ class KiroBackend:
             request_timeout=120.0,
         )
 
+    def workspace_for(self, opts: TurnOptions) -> str:
+        """Kiro's cwd for a turn: the request's workspace, else the harness scratch
+        directory for harness turns, else the configured workspace."""
+        if opts.workspace:
+            return opts.workspace
+        if opts.emulate_tools:
+            return self.settings.harness_workspace or self._harness_dir or self.settings.workspace
+        return self.settings.workspace
+
     def engine_for(self, opts: TurnOptions) -> str:
         if opts.emulate_tools and self.settings.harness_engine:
             return self.settings.harness_engine
@@ -486,7 +505,7 @@ class KiroBackend:
             mode=opts.agent,
             effort=opts.effort,
             engine=engine,
-            workspace=opts.workspace,
+            workspace=self.workspace_for(opts),
             extra_rules=extra_rules,
         )
         try:
@@ -517,7 +536,7 @@ class KiroBackend:
             mode=opts.agent,
             effort=opts.effort,
             permissions=permissions,
-            workspace=opts.workspace or self.settings.workspace,
+            workspace=self.workspace_for(opts),
             bridge=bridge,
             tools_signature=tools_signature(tools) if use_bridge else "",
         )
@@ -547,7 +566,7 @@ class KiroBackend:
                         and pooled.mode == opts.agent
                         and pooled.permissions == permissions
                         and pooled.agent.engine == self.engine_for(opts)
-                        and pooled.workspace == (opts.workspace or self.settings.workspace)
+                        and pooled.workspace == self.workspace_for(opts)
                         and pooled.tools_signature == signature
                         and (opts.effort is None or pooled.effort == opts.effort)
                         and pooled.agent.client.is_running

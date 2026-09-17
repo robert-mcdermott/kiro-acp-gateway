@@ -66,6 +66,11 @@ class Settings(BaseSettings):
         description="Kiro engine for harness-mode turns (client-defined tools); empty = same as engine. "
         "v2 follows the emulated tool protocol far more reliably than v3.",
     )
+    harness_workspace: str = Field(
+        default="",
+        description="Directory Kiro runs in for harness turns (client-defined tools). Empty = a fresh empty scratch "
+        "directory, so Kiro does not load the gateway workspace's README/AGENTS/steering files into harness prompts",
+    )
     harness_agent: str | None = Field(
         default="kiro-gateway-harness",
         description="Tool-less Kiro agent selected while emulating client tools (empty = keep the default agent)",
