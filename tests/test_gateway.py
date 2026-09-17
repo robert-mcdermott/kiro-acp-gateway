@@ -1427,6 +1427,172 @@ async def test_acp_errors_outside_turns_are_classified(client: httpx.AsyncClient
     assert response.json()["error"]["code"] == "kiro_auth"
 
 
+MCP_CATALOGUE = json.dumps(
+    {
+        "mcpServers": {
+            "time": {"command": "uvx", "args": ["mcp-server-time"], "env": {"TZ": "UTC"}},
+            "docs": {"type": "http", "url": "https://docs.example/mcp", "headers": {"X-Key": "k"}},
+            "off": {"command": "x", "disabled": True},
+        }
+    }
+)
+
+
+@pytest.fixture
+async def mcp_catalogue_client(workspace: Path, engine: str, tmp_path: Path):
+    (workspace / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"repo": {"command": "npx", "args": ["-y", "repo-mcp"]}}})
+    )
+    (workspace / "opencode.json").write_text(
+        json.dumps(
+            {"mcp": {"oc": {"type": "local", "command": ["node", "oc.js"], "enabled": True}}}
+        )
+    )
+    settings = make_settings(
+        workspace,
+        engine=engine,
+        mcp_servers=MCP_CATALOGUE,
+        mcp_servers_default=["time"],
+        mcp_discovery=True,
+    )
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=60,
+        ) as http:
+            http.app = app  # type: ignore[attr-defined]
+            yield http
+
+
+async def test_mcp_servers_default_discovered_and_requested(
+    mcp_catalogue_client: httpx.AsyncClient,
+) -> None:
+    async def names(**extra):
+        response = await mcp_catalogue_client.post(
+            "/v1/chat/completions",
+            json={"model": "x", "messages": [{"role": "user", "content": "mcp?"}], **extra},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        return body["choices"][0]["message"]["content"], body["kiro"].get("mcp_servers")
+
+    # default catalogue entry + everything discovered in the workspace
+    text, listed = await names()
+    assert text == "mcp servers: time, repo, oc" and listed == ["time", "repo", "oc"]
+    # a request adds a catalogue name; disabled entries are not in the catalogue
+    text, _ = await names(kiro={"mcp_servers": ["docs"]})
+    assert "docs" in text
+    bad = await mcp_catalogue_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "mcp?"}],
+            "kiro": {"mcp_servers": ["off"]},
+        },
+    )
+    assert bad.status_code == 400 and bad.json()["error"]["code"] == "unknown_mcp_server"
+    # inline definitions are refused unless allowed
+    inline = await mcp_catalogue_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "mcp?"}],
+            "kiro": {"mcp_servers": [{"name": "adhoc", "command": "evil"}]},
+        },
+    )
+    assert inline.status_code == 403 and inline.json()["error"]["code"] == "mcp_server_not_allowed"
+    # header form
+    header = await mcp_catalogue_client.post(
+        "/v1/chat/completions",
+        headers={"X-Kiro-MCP-Servers": "docs"},
+        json={"model": "x", "messages": [{"role": "user", "content": "mcp?"}]},
+    )
+    assert "docs" in header.json()["choices"][0]["message"]["content"]
+
+
+async def test_mcp_servers_ignored_for_harness_requests(
+    mcp_catalogue_client: httpx.AsyncClient,
+) -> None:
+    response = await mcp_catalogue_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "echo: hi"}],
+            "tools": [READ_TOOL],
+            "kiro": {"mcp_servers": ["docs"]},
+        },
+    )
+    assert response.status_code == 200
+    assert "mcp_servers" not in response.json()["kiro"]
+
+
+async def test_inline_agent(client: httpx.AsyncClient, engine: str) -> None:
+    body = {
+        "model": "x",
+        "messages": [{"role": "user", "content": "agent?"}],
+        "kiro": {"agent": {"prompt": "You are a haiku bot.", "tools": ["read"]}},
+    }
+    response = await client.post("/v1/chat/completions", json=body)
+    if engine == "v2":
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "agent_requires_v3"
+        return
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    text = reply["choices"][0]["message"]["content"]
+    assert text.startswith("mode gateway-inline-") and "prompt: You are a haiku bot." in text
+    assert "tools: read" in text
+    assert reply["kiro"]["agent"].startswith("gateway-inline-")
+    # Anthropic route, same extension; invalid definitions are 400
+    anthropic = await client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={
+            "model": "x",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "agent?"}],
+            "kiro": {"agent": {"prompt": "Be brief."}},
+        },
+    )
+    assert (
+        anthropic.status_code == 200
+        and "prompt: Be brief." in anthropic.json()["content"][0]["text"]
+    )
+    invalid = await client.post(
+        "/v1/chat/completions", json={**body, "kiro": {"agent": {"tools": "read"}}}
+    )
+    assert invalid.status_code == 400 and invalid.json()["error"]["code"] == "invalid_agent"
+
+
+async def test_harness_agent_sent_over_the_wire_on_v3(workspace: Path, engine: str) -> None:
+    if engine != "v3":
+        pytest.skip("v3 only")
+    settings = make_settings(
+        workspace, engine="v3", harness_engine="v3", harness_agent="kiro-gateway-harness"
+    )
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://gw", headers={"Authorization": "Bearer secret"}
+        ) as http:
+            response = await http.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "x",
+                    "messages": [{"role": "user", "content": "agent?"}],
+                    "tools": [READ_TOOL],
+                },
+            )
+            assert response.status_code == 200, response.text
+            text = response.json()["choices"][0]["message"]["content"]
+            assert text.startswith("mode kiro-gateway-harness;") and "tools: " in text
+
+
 async def test_metrics_endpoint(client: httpx.AsyncClient) -> None:
     await client.post(
         "/v1/chat/completions",

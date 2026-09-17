@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import Any
 
 from kiro_acp import __version__
 from kiro_acp.acp import (
@@ -40,8 +41,18 @@ from kiro_acp.gateway.activity import render_completed, render_plan, render_star
 from kiro_acp.gateway.codex import CodexCatalogCache
 from kiro_acp.gateway.config import Settings
 from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart, ToolDef
-from kiro_acp.gateway.harness_agent import ensure_harness_agent
+from kiro_acp.gateway.harness_agent import agent_config, ensure_harness_agent
+from kiro_acp.gateway.inline_agent import custom_agent, harness_custom_agent
 from kiro_acp.gateway.limits import StreamLimiter
+from kiro_acp.gateway.mcp_servers import (
+    McpServerError,
+    discover,
+    normalize_server,
+    parse_catalogue,
+)
+from kiro_acp.gateway.mcp_servers import (
+    signature as mcp_signature,
+)
 from kiro_acp.gateway.mcp_turn import END, BridgeCall, PendingTurn
 from kiro_acp.gateway.metrics import Metrics
 from kiro_acp.gateway.prompting import assistant_message, render_prompt
@@ -208,6 +219,8 @@ class TurnOptions:
     max_tokens: int | None = None
     allow_retry: bool = False  # non-streaming requests may re-prompt to fix invalid JSON output
     workspace: str | None = None
+    mcp_servers: list[Any] = field(default_factory=list)  # names (str) or raw definitions (dict)
+    inline_agent: JSON | None = None  # validated kiro.agent object (v3 engine only)
 
 
 @dataclass(eq=False)
@@ -222,6 +235,7 @@ class PooledSession:
     bridge: BridgeSession | None = None
     pending: PendingTurn | None = None
     tools_signature: str = ""
+    mcp_signature: str = ""
     fingerprint: str | None = None
     last_used: float = field(default_factory=time.monotonic)
     busy: bool = False
@@ -256,6 +270,8 @@ class KiroBackend:
         self._harness_dir: str | None = None
         self.metrics = Metrics()
         self.codex_catalog = CodexCatalogCache()
+        self.mcp_catalogue: dict[str, JSON] = {}
+        self._discovered: dict[str, dict[str, JSON]] = {}
         self._active: set[PooledSession] = set()
         self.bridge_broker: ToolBridgeBroker | None = None
         self.started = False
@@ -274,6 +290,17 @@ class KiroBackend:
                     ensure_harness_agent(name, mcp=mcp)
                 except OSError as error:
                     LOG.warning("Could not provision harness agent %r: %s", name, error)
+        try:
+            self.mcp_catalogue = parse_catalogue(self.settings.mcp_servers)
+        except McpServerError as error:
+            raise RuntimeError(f"KIRO_GATEWAY_MCP_SERVERS: {error}") from error
+        if self.mcp_catalogue:
+            LOG.info("MCP catalogue: %s", ", ".join(sorted(self.mcp_catalogue)))
+        for name in self.settings.mcp_servers_default:
+            if name not in self.mcp_catalogue:
+                raise RuntimeError(
+                    f"KIRO_GATEWAY_MCP_SERVERS_DEFAULT names unknown server {name!r}"
+                )
         if not self.settings.harness_workspace:
             # Harness turns: the client executes every tool, so Kiro's cwd only matters
             # for what it auto-loads (README, AGENTS.md, steering). Give it nothing.
@@ -468,6 +495,66 @@ class KiroBackend:
             request_timeout=120.0,
         )
 
+    def _resolve_mcp_servers(self, opts: TurnOptions) -> None:
+        """Turn request names/definitions into ACP ``mcpServers`` entries (agent mode only)."""
+        requested = list(opts.mcp_servers)
+        opts.mcp_servers = []
+        if opts.emulate_tools:
+            if requested:
+                LOG.info("Ignoring mcp_servers on a harness request %s", opts.request_id)
+            return
+        available = dict(self.mcp_catalogue)
+        discovered: dict[str, JSON] = {}
+        if self.settings.mcp_discovery:
+            workspace = self.workspace_for(opts)
+            if workspace not in self._discovered:
+                self._discovered[workspace] = discover(workspace)
+            discovered = self._discovered[workspace]
+            available.update(discovered)
+        chosen: dict[str, JSON] = {}
+        for name in self.settings.mcp_servers_default:
+            chosen[name] = available[name]
+        chosen.update(discovered)
+        for item in requested:
+            if isinstance(item, str):
+                if item not in available:
+                    raise GatewayError(
+                        f"Unknown MCP server {item!r}; configured: "
+                        f"{', '.join(sorted(available)) or 'none'}",
+                        status=400,
+                        code="unknown_mcp_server",
+                    )
+                chosen[item] = available[item]
+            elif isinstance(item, dict):
+                if not self.settings.allow_request_mcp_servers:
+                    raise GatewayError(
+                        "Inline MCP server definitions are disabled "
+                        "(KIRO_GATEWAY_ALLOW_REQUEST_MCP_SERVERS); use a catalogue name",
+                        status=403,
+                        error_type="permission_error",
+                        code="mcp_server_not_allowed",
+                    )
+                name = str(item.get("name") or "")
+                try:
+                    chosen[name] = normalize_server(
+                        name, {k: v for k, v in item.items() if k != "name"}
+                    )
+                except McpServerError as error:
+                    raise GatewayError(str(error), status=400, code="invalid_mcp_server") from error
+            else:
+                raise GatewayError(
+                    "mcp_servers entries must be names or objects", code="invalid_mcp_server"
+                )
+        opts.mcp_servers = list(chosen.values())
+
+    def _inline_agent_wire(self, opts: TurnOptions) -> JSON:
+        assert opts.inline_agent is not None
+        wire = custom_agent(opts.inline_agent)
+        if opts.mcp_servers:
+            refs = [f"@{s['name']}" for s in opts.mcp_servers]
+            wire["tools"] = list(dict.fromkeys([*wire.get("tools", []), *refs]))
+        return wire
+
     def workspace_for(self, opts: TurnOptions) -> str:
         """Kiro's cwd for a turn: the request's workspace, else the harness scratch
         directory for harness turns, else the configured workspace."""
@@ -504,6 +591,24 @@ class KiroBackend:
                 PermissionRule.parse("allow:title=*@harness/*"),
                 PermissionRule.parse("allow:tool=@harness/*"),
             ]
+        mcp_servers.extend(opts.mcp_servers)
+        meta: JSON | None = None
+        if engine == "v3":
+            custom_agents: list[JSON] = []
+            if opts.inline_agent is not None:
+                custom_agents.append(self._inline_agent_wire(opts))
+            elif opts.emulate_tools and opts.agent in (
+                self.settings.harness_agent,
+                self.settings.harness_agent_mcp,
+            ):
+                # No agent file needed on v3: send the harness agent over the wire.
+                custom_agents.append(
+                    harness_custom_agent(
+                        agent_config(opts.agent, mcp=opts.agent == self.settings.harness_agent_mcp)
+                    )
+                )
+            if custom_agents:
+                meta = {"kiro": {"customAgents": custom_agents}}
         agent = self._make_agent(
             permissions=permissions,
             model=opts.model,
@@ -521,6 +626,7 @@ class KiroBackend:
                 effort=opts.effort,
                 mcp_servers=mcp_servers,
                 autopilot=(permissions == "allow-all") if engine == "v3" else None,
+                meta=meta,
             )
         except ACPRemoteError as error:
             await agent.close()
@@ -544,6 +650,7 @@ class KiroBackend:
             workspace=self.workspace_for(opts),
             bridge=bridge,
             tools_signature=tools_signature(tools) if use_bridge else "",
+            mcp_signature=mcp_signature(opts.mcp_servers),
         )
 
     # ---------------------------------------------------------------- session selection
@@ -573,6 +680,7 @@ class KiroBackend:
                         and pooled.agent.engine == self.engine_for(opts)
                         and pooled.workspace == self.workspace_for(opts)
                         and pooled.tools_signature == signature
+                        and pooled.mcp_signature == mcp_signature(opts.mcp_servers)
                         and (opts.effort is None or pooled.effort == opts.effort)
                         and pooled.agent.client.is_running
                     ):
@@ -658,6 +766,22 @@ class KiroBackend:
                     code="workspace_not_allowed",
                 )
             opts.workspace = candidate
+        self._resolve_mcp_servers(opts)
+        if opts.inline_agent is not None:
+            if not self.settings.allow_request_agents:
+                raise GatewayError(
+                    "Inline agent definitions are disabled (KIRO_GATEWAY_ALLOW_REQUEST_AGENTS)",
+                    status=403,
+                    error_type="permission_error",
+                    code="agent_not_allowed",
+                )
+            if self.engine_for(opts) != "v3":
+                raise GatewayError(
+                    "Inline agent definitions need the v3 engine (KIRO_GATEWAY_ENGINE=v3)",
+                    status=400,
+                    code="agent_requires_v3",
+                )
+            opts.agent = self._inline_agent_wire(opts)["id"]
         if opts.agent is None:
             if opts.emulate_tools:
                 opts.agent = (
@@ -733,6 +857,8 @@ class KiroBackend:
             }
             if session.effort_error:
                 kiro_meta["effort_warning"] = session.effort_error
+            if opts.mcp_servers:
+                kiro_meta["mcp_servers"] = [s["name"] for s in opts.mcp_servers]
             finish = "stop"
             error: str | None = None
             completed = False

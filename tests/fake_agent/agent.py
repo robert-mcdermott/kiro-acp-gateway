@@ -12,6 +12,8 @@ Behaviour is driven by the *prompt text* so tests can request scenarios:
 * ``"crash"``                 – exits the process mid-turn.
 * ``"/effort <level>"``       – replies ``Effort set to <level>`` (v2 style).
 * ``"refuse"``                – answers, then sends ``_kiro.dev/metadata`` with ``CONTENT_FILTERED``.
+* ``"mcp?"``                  – lists the names of the session's ``mcpServers``.
+* ``"agent?"``                – reports the current mode and, for a wire-injected custom agent, its prompt/tools.
 * ``_kiro.dev/commands/execute`` (v2) – object-form ``effort`` command answered in the response.
 * anything else              – replies with a fixed sentence.
 
@@ -112,12 +114,18 @@ class Agent:
         if method == "session/new":
             self.session_counter += 1
             session_id = f"fake-{self.session_counter}"
+            custom = ((params.get("_meta") or {}).get("kiro") or {}).get("customAgents") or []
+            if custom and ENGINE != "v3":
+                raise RpcError(-32602, "Invalid params", "customAgents need the v3 engine")
             self.sessions[session_id] = {
                 "cwd": params.get("cwd"),
                 "model": MODELS[0],
                 "mode": MODES[0],
                 "autopilot": "on",
                 "mcp": params.get("mcpServers") or [],
+                "custom_agents": {
+                    a["id"]: a for a in custom if isinstance(a, dict) and a.get("id")
+                },
             }
             return self.session_result(session_id)
         if method == "session/load":
@@ -184,7 +192,7 @@ class Agent:
             return {}
         if method == "session/set_mode":
             session = self.session(params)
-            if params.get("modeId") not in MODES:
+            if params.get("modeId") not in self.modes(session):
                 raise RpcError(-32603, "Internal error", f"Mode '{params.get('modeId')}' not found")
             session["mode"] = params["modeId"]
             return {}
@@ -195,7 +203,7 @@ class Agent:
             config_id, value = params.get("configId"), params.get("value")
             if config_id == "model" and value in MODELS:
                 session["model"] = value
-            elif config_id == "mode" and value in MODES:
+            elif config_id == "mode" and value in self.modes(session):
                 session["mode"] = value
             elif config_id == "autopilot" and value in ("on", "off"):
                 session["autopilot"] = value
@@ -212,6 +220,9 @@ class Agent:
             raise RpcError(-32602, "Invalid params", "unknown session")
         return session
 
+    def modes(self, session: JSON) -> list[str]:
+        return [*MODES, *session.get("custom_agents", {})]
+
     def config_options(self, session: JSON) -> list[JSON]:
         return [
             {
@@ -220,7 +231,7 @@ class Agent:
                 "name": "Mode",
                 "category": "mode",
                 "currentValue": session["mode"],
-                "options": [{"value": m, "name": m} for m in MODES],
+                "options": [{"value": m, "name": m} for m in self.modes(session)],
             },
             {
                 "type": "select",
@@ -246,12 +257,12 @@ class Agent:
             result["configOptions"] = self.config_options(session)
             result["modes"] = {
                 "currentModeId": session["mode"],
-                "availableModes": [{"id": m, "name": m} for m in MODES],
+                "availableModes": [{"id": m, "name": m} for m in self.modes(session)],
             }
         else:
             result["modes"] = {
                 "currentModeId": session["mode"],
-                "availableModes": [{"id": m, "name": m} for m in MODES],
+                "availableModes": [{"id": m, "name": m} for m in self.modes(session)],
             }
             result["models"] = {
                 "currentModelId": session["model"],
@@ -329,6 +340,20 @@ class Agent:
                 result = await client.call(name, json.loads(raw_args))
                 await say("result: " + result)
             await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 5})
+            return {"stopReason": "end_turn"}
+        if text == "mcp?":
+            names = [s.get("name") for s in session.get("mcp") or []]
+            await say("mcp servers: " + (", ".join(names) or "none"))
+            return {"stopReason": "end_turn"}
+        if text == "agent?":
+            mode = session["mode"]
+            custom = session.get("custom_agents", {}).get(mode)
+            if custom:
+                await say(
+                    f"mode {mode}; prompt: {custom.get('prompt')}; tools: {','.join(custom.get('tools', []))}"
+                )
+            else:
+                await say(f"mode {mode}; builtin")
             return {"stopReason": "end_turn"}
         if text == "refuse":
             await say("I can't help with that request.")

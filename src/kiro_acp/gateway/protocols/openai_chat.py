@@ -292,6 +292,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                 stop_sequences=stop_list(body.get("stop")),
                 max_tokens=int_or_none(body.get("max_completion_tokens") or body.get("max_tokens")),
             ),
+            body=body,
         )
         completion_id = new_id("chatcmpl-")
         created = now()

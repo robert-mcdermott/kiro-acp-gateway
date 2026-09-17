@@ -375,6 +375,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                 allow_retry=not body.get("stream"),
                 max_tokens=int_or_none(body.get("max_output_tokens")),
             ),
+            body=body,
         )
         response_id = new_id("resp_")
         created = now()

@@ -127,7 +127,7 @@ recorded for the roadmap (P6):
 | Method / field | Direction | Notes |
 |---|---|---|
 | `_kiro.dev/commands/execute` | client → agent | `{"sessionId", "command": {"command": "effort", "args": {"value": "high"}}}` → `{"success": true, "message": "..."}` on 2.22 (now used for effort); string form gets no response. v2 only. |
-| `session/new._meta.kiro.customAgents` | client → agent | v3: inline agent definitions (max 50), activated with `session/set_mode`. |
+| `session/new._meta.kiro.customAgents` | client → agent | v3: inline agent definitions (max 50), activated with `session/set_mode`. Confirmed on 2.22: `[{"id", "prompt", "tools": [...], "description"?, "mcpServers"?: {name: {command,args,env}}}]`; the id appears in `modes.availableModes` and the `mode` config option; `tools: ["@name"]` resolves against both in-agent and session-level `mcpServers`. Registering an id that also exists as a file does not error. |
 | `_kiro.dev/session/terminate` | client → agent | v2: evict a session from a multiplexed process and reap its MCP children. |
 | `_session/steer` | client → agent | v2: `{"sessionId", "message": "<user_message>...</user_message>"}` mid-turn; `steering_consumed` update confirms. |
 | `session/load._meta["_kiro.dev/session_file"]` | client → agent | Load from an explicit session file; success = `modes` in the response; transcript is replayed as updates. |

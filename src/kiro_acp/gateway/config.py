@@ -87,6 +87,31 @@ class Settings(BaseSettings):
     )
     serve_terminal: bool = Field(default=False, description="Advertise terminal/* to the agent")
 
+    # --- MCP servers and inline agents (agent mode) -------------------------
+    mcp_servers: str = Field(
+        default="",
+        description="MCP servers agent-mode requests may attach by name: JSON in the Claude Code / Cursor "
+        "mcpServers shape ({name: {command,args,env} | {type: http|sse, url, headers}}) or the path of such a file",
+    )
+    mcp_servers_default: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description="Names from the MCP catalogue attached to every agent-mode turn",
+    )
+    mcp_discovery: bool = Field(
+        default=False,
+        description="Discover MCP servers from the workspace's .mcp.json (Claude Code), .cursor/mcp.json, "
+        ".vscode/mcp.json and opencode.json(c); discovered servers join the catalogue and are attached by default",
+    )
+    allow_request_mcp_servers: bool = Field(
+        default=False,
+        description="Accept full MCP server definitions (commands, URLs) inline in requests, not only catalogue names. "
+        "A stdio definition runs a command on the gateway host, so leave this off for untrusted clients",
+    )
+    allow_request_agents: bool = Field(
+        default=True,
+        description="Accept inline agent definitions (prompt, tools, MCP servers) in requests; v3 engine only",
+    )
+
     codex_catalog: bool = Field(
         default=True,
         description="Answer Codex's GET /v1/models?client_version=... with a Codex model catalogue "
@@ -242,7 +267,12 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
-        "permission_rules", "api_keys", "cors_origins", "allowed_workspaces", mode="before"
+        "permission_rules",
+        "api_keys",
+        "cors_origins",
+        "allowed_workspaces",
+        "mcp_servers_default",
+        mode="before",
     )
     @classmethod
     def _parse_list(cls, value: object) -> object:

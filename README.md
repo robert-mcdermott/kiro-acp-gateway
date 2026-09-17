@@ -546,7 +546,9 @@ and installs them itself. Nothing has to be done by hand on a new machine:
   a gateway session.
 - Set `KIRO_GATEWAY_PROVISION_HARNESS_AGENT=false` where the gateway must not write to the
   home directory and install the two files with your own tooling; the JSON to install is
-  `kiro_acp.gateway.harness_agent.agent_config(name, mcp=...)`.
+  `kiro_acp.gateway.harness_agent.agent_config(name, mcp=...)`. With
+  `KIRO_GATEWAY_HARNESS_ENGINE=v3` no files are needed at all: the v3 engine receives the
+  agent definition over the wire on every session.
 
 ### How requests are translated
 
@@ -613,14 +615,60 @@ some models; when it cannot be applied the response carries `kiro.effort_warning
 to report zeros.
 
 **Images** are accepted as base64 (`data:` URLs or Anthropic `base64` sources). Remote
-image URLs are not fetched.
+image URLs are not fetched. Document blocks (PDFs) are not accepted; put the file in the
+workspace and ask Kiro to read it, which also lets the model page through it.
 
-**Per-request headers.** `X-Kiro-Agent` selects a Kiro agent, `X-Kiro-Effort` sets effort,
-`X-Kiro-Permissions` overrides the permission policy when
-`KIRO_GATEWAY_ALLOW_PERMISSION_OVERRIDE=true`, and `X-Kiro-Workspace` selects the
-directory Kiro works in when it matches `KIRO_GATEWAY_ALLOWED_WORKSPACES`. One gateway
-can therefore serve several projects in agent mode; sessions are pooled per workspace and
-the response's `kiro.workspace` shows which one was used.
+**Per-request options.** Headers: `X-Kiro-Agent` selects a Kiro agent, `X-Kiro-Effort`
+sets effort, `X-Kiro-Permissions` overrides the permission policy when
+`KIRO_GATEWAY_ALLOW_PERMISSION_OVERRIDE=true`, `X-Kiro-Workspace` selects the directory
+Kiro works in when it matches `KIRO_GATEWAY_ALLOWED_WORKSPACES`, and `X-Kiro-MCP-Servers`
+attaches catalogue MCP servers by name. The same options can travel in the request body
+as a `kiro` object (the OpenAI and Anthropic SDKs pass it through `extra_body`):
+
+```json
+"kiro": {"agent": "plan", "effort": "high", "workspace": "/Users/me/code/project-b",
+         "mcp_servers": ["jira", "docs"], "permissions": "allow-all"}
+```
+
+Headers win over the body. One gateway can therefore serve several projects in agent
+mode; sessions are pooled per workspace (and per MCP server set and agent) and the
+response's `kiro.workspace`, `kiro.agent`, and `kiro.mcp_servers` show what was used.
+
+**MCP servers for agent-mode turns.** Kiro's own agents already carry the MCP servers
+configured in Kiro. A gateway-side catalogue adds servers per request without touching
+Kiro's config: `KIRO_GATEWAY_MCP_SERVERS` is either inline JSON or the path of a file in
+the usual `mcpServers` shape (Claude Code, Cursor, VS Code `servers`, and OpenCode `mcp`
+blocks are all understood; stdio and `http`/`sse` entries; `disabled` entries are
+skipped). Requests select entries by name (`kiro.mcp_servers` or `X-Kiro-MCP-Servers`);
+`KIRO_GATEWAY_MCP_SERVERS_DEFAULT` names entries attached to every agent-mode turn, and
+`KIRO_GATEWAY_MCP_DISCOVERY=true` also attaches whatever the workspace's own `.mcp.json`,
+`.cursor/mcp.json`, `.vscode/mcp.json`, or `opencode.json[c]` declares. Full definitions
+inline in a request are refused unless `KIRO_GATEWAY_ALLOW_REQUEST_MCP_SERVERS=true`,
+because a stdio definition runs a command on the gateway host. Harness requests ignore
+MCP servers (the harness executes tools itself). Tool calls made through these servers are
+still subject to the permission policy and rules.
+
+**Inline agents (v3 engine).** Instead of naming a Kiro agent, an agent-mode request may
+define one: `kiro.agent` as an object with `prompt` (required), `tools` (Kiro tool names;
+`["*"]` for all built-in tools, `[]` for none; default all), and an optional
+`description`. Attached MCP servers are referenced automatically. The definition travels
+to Kiro over the wire and is registered for that session only; nothing is written to
+`~/.kiro/agents`. The reply's `kiro.agent` carries the generated id. Requires
+`KIRO_GATEWAY_ENGINE=v3` (the default); on v2 the request is rejected with
+`agent_requires_v3`. `KIRO_GATEWAY_ALLOW_REQUEST_AGENTS=false` disables it. On v3 the
+harness agents are sent the same way, so the files in `~/.kiro/agents` are only needed
+for the v2 engine.
+
+```python
+r = requests.post(f"{GATEWAY}/v1/chat/completions", headers=HEADERS, json={
+    "model": "claude-sonnet-4.6",
+    "messages": [{"role": "user", "content": "Summarise open incidents from the last day."}],
+    "kiro": {
+        "agent": {"prompt": "You are an SRE assistant. Be terse and cite incident ids.", "tools": []},
+        "mcp_servers": ["pagerduty"],          # a name from KIRO_GATEWAY_MCP_SERVERS
+    },
+})
+```
 
 **Structured output.** With `response_format` (OpenAI) or `output_config.format`
 (Anthropic) carrying a JSON schema, the reply is fence-stripped and validated. A
@@ -681,6 +729,11 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_EXPOSE_THOUGHTS` | `true` | Forward Kiro's thinking. |
 | `KIRO_GATEWAY_USAGE_ESTIMATES` | `true` | Estimated token counts. |
 | `KIRO_GATEWAY_MAX_IMAGE_BYTES` | `5242880` | Reject image inputs larger than this (decoded bytes) with `400 image_too_large`; an oversized image can wedge a Kiro session. `0` disables. Images are dropped with a note when the agent does not advertise image input. |
+| `KIRO_GATEWAY_MCP_SERVERS` | empty | MCP server catalogue for agent-mode requests: inline JSON or a file path in the `mcpServers` shape (stdio or `http`/`sse`). |
+| `KIRO_GATEWAY_MCP_SERVERS_DEFAULT` | empty | Catalogue names attached to every agent-mode turn. |
+| `KIRO_GATEWAY_MCP_DISCOVERY` | `false` | Also attach servers declared in the workspace's `.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, or `opencode.json[c]`. |
+| `KIRO_GATEWAY_ALLOW_REQUEST_MCP_SERVERS` | `false` | Accept full MCP server definitions in requests (runs commands on the gateway host). |
+| `KIRO_GATEWAY_ALLOW_REQUEST_AGENTS` | `true` | Accept inline agent definitions (`kiro.agent` objects); v3 engine only. |
 | `KIRO_GATEWAY_CODEX_CATALOG` | `true` | Answer Codex's `GET /v1/models?client_version=...` with a Codex model catalogue for every Kiro model. |
 | `KIRO_GATEWAY_CODEX_TOOL_MODE` | `direct` | Tool style that catalogue selects for Codex: `direct` function tools or `code` mode. |
 | `KIRO_GATEWAY_METRICS` | `true` | Serve Prometheus metrics at `/metrics` (same authentication as `/v1`). |

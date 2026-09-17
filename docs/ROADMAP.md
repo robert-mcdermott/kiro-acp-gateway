@@ -84,12 +84,13 @@ Kiro history, works on v3. Risks: turn lifetime across requests, parallel calls,
 permission prompts (auto-allow the bridge server), idle cleanup. Prototype behind
 `KIRO_GATEWAY_TOOL_MODE=mcp` and keep `emulate` as fallback.
 
-### 10. Harness MCP passthrough for agent mode — M
+### 10. Harness MCP passthrough for agent mode — DONE — M
 Let agent-mode callers give Kiro extra tools: read Claude Code / OpenCode / Codex MCP
 config files from the workspace (opt-in, `KIRO_GATEWAY_HARNESS_MCP=true`) and register
 them on `session/new`. Normalize entry shapes (HTTP entries need `type: "http"` and
 `headers` as an array or `session/new` hangs), bound `session/new` with a timeout, and
 retry once with `mcpServers: []`.
+*Done (2026-09-17):* Superseded by the catalogue design in #22: discovery from Claude Code/Cursor/VS Code/OpenCode files (`KIRO_GATEWAY_MCP_DISCOVERY`), normalised entries, verified live on both engines.
 
 ### 11. Per-request workspace selection (opt-in, allow-listed) — DONE — M
 Keep the server-controlled default, but allow `X-Kiro-Workspace` when the value is under
@@ -158,12 +159,13 @@ races, with secrets masked (bearer tokens, `sk-`/`gh*_`/`AKIA` keys, URL credent
 Expose as `GET /v1/kiro/sessions/{id}/audit` behind the API key and reference it from
 the `kiro` response field. Complements #14 (metrics).
 
-### 22. MCP servers per request and harness MCP discovery *(extends #10)* — M
+### 22. MCP servers per request and harness MCP discovery *(extends #10)* — DONE — M
 Accept `X-Kiro-MCP-Servers` / body `mcp_servers` (validated against an allow-list) in
 addition to config-file discovery for Claude Code (`~/.claude.json` projects,
 `<ws>/.mcp.json`), OpenCode (`opencode.json[c]` `mcp` block), Cursor/VS Code
 (`.cursor/mcp.json`, `.vscode/mcp.json`), and Kilo. Agent mode only; harness mode keeps
 the tool-less agent. Normalize HTTP entries (`type: "http"`, `headers` as an array).
+*Done (2026-09-17):* `KIRO_GATEWAY_MCP_SERVERS` catalogue, `X-Kiro-MCP-Servers` / `kiro.mcp_servers`, defaults, discovery, inline definitions behind `KIRO_GATEWAY_ALLOW_REQUEST_MCP_SERVERS`; sessions pooled per server set. Verified live: a probe MCP server's tool was called on v2 and v3.
 
 ### 23. Client example configurations *(pattern)* — DONE — S
 An `examples/clients/` directory with ready-to-use configs and a one-line verification
@@ -194,10 +196,11 @@ with zero client configuration and no "model metadata not found" warning. Cache 
 upstream reference catalogue per Codex version and fall back gracefully offline.
 *Done (2026-09-17):* `GET /v1/models?client_version=` returns a Codex catalogue built from the cached reference entry for that Codex version; verified live with Codex 0.154 (no decode or metadata warnings). `KIRO_GATEWAY_CODEX_CATALOG`, `KIRO_GATEWAY_CODEX_TOOL_MODE`.
 
-### 25. Document and PDF inputs *(pattern)* — S
+### 25. Document and PDF inputs *(pattern)* — S, deferred
 Anthropic `document` blocks with base64 PDF sources and OpenAI `file` parts: extract text
 locally (`pypdf`, optional dependency) and attach it as a text block; keep the current
 clear error when extraction is unavailable.
+*2026-09-17:* Deferred: harnesses never send document blocks and agent-mode scripts get better results by placing the file in the workspace (Kiro can page through it). The README now says so. Revisit only if a real pipeline needs inline documents.
 
 ### 26. Service installation scripts *(pattern)* — DONE — S
 `scripts/install-service.sh` generating a launchd plist (macOS) or systemd unit (Linux)
@@ -228,12 +231,13 @@ produce assistant text, and cannot be distinguished from a real reply. Switch v2
 `set_effort` to the command request with the prompt form as a fallback for older CLIs.
 *Done (2026-09-17):* Uses the object form; the response carries `{success, message}` on kiro-cli 2.22. Falls back to the `/effort` prompt on method-not-found or no answer.
 
-### 30. Wire-injected agents on v3 — M
+### 30. Wire-injected agents on v3 — DONE — M
 On the KAS engine `session/new` accepts `_meta.kiro.customAgents: [<agent json>...]`
 (max 50) and `session/set_mode` activates one, so no file in `~/.kiro/agents` is needed.
 Use it for v3 harness turns and for per-request agent definitions (an API caller could
 supply prompt, tools, and MCP servers inline, which #10/#22 want anyway). Keep file
 provisioning for v2, which only takes `--agent <name>` at launch.
+*Done (2026-09-17):* `kiro.agent` inline definitions (`_meta.kiro.customAgents` + `session/set_mode`), v3 only, with attached MCP servers referenced as `@name`; v3 harness turns also send the harness agent over the wire. Verified live with an inline agent calling a catalogue MCP tool and with Claude Code on `KIRO_GATEWAY_HARNESS_ENGINE=v3`.
 
 ### 31. Surface model refusals and content filtering — DONE — S
 `_kiro.dev/metadata` can carry `stopReason: "CONTENT_FILTERED"` and

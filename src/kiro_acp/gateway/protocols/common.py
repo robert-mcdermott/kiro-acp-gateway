@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from kiro_acp.gateway.backend import GatewayError, TurnOptions
 from kiro_acp.gateway.conversation import JSON, ImagePart, ToolCallPart, ToolDef
+from kiro_acp.gateway.inline_agent import InlineAgentError, parse_inline_agent
 
 _DATA_URL_RE = re.compile(
     r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?:;charset=[\w-]+)?;base64,(?P<data>.+)$", re.DOTALL
@@ -106,8 +107,40 @@ def image_from_data_url(url: str, *, default_mime: str = "image/png") -> ImagePa
     return ImagePart(mime_type=match.group("mime") or default_mime, data_base64=data)
 
 
-def header_options(request: Request, opts: TurnOptions) -> TurnOptions:
-    """Apply ``X-Kiro-*`` request headers (agent, effort, permissions)."""
+def header_options(request: Request, opts: TurnOptions, body: JSON | None = None) -> TurnOptions:
+    """Apply ``X-Kiro-*`` request headers and the ``kiro`` body extension.
+
+    Body form (usable through the SDKs' ``extra_body``)::
+
+        "kiro": {"agent": "<name>" | {"prompt": ..., "tools": [...]}, "mcp_servers": ["name", {...}],
+                 "effort": "high", "workspace": "/path", "permissions": "allow-all"}
+
+    Headers: ``X-Kiro-Agent``, ``X-Kiro-Effort``, ``X-Kiro-Permissions``, ``X-Kiro-Workspace``,
+    ``X-Kiro-MCP-Servers`` (comma-separated catalogue names). Headers win over the body.
+    """
+    extension = body.get("kiro") if isinstance(body, dict) else None
+    if isinstance(extension, dict):
+        agent = extension.get("agent")
+        if isinstance(agent, str) and agent:
+            opts.agent = agent
+        elif isinstance(agent, dict):
+            try:
+                opts.inline_agent = parse_inline_agent(agent)
+            except InlineAgentError as error:
+                raise GatewayError(str(error), code="invalid_agent") from error
+        servers = extension.get("mcp_servers")
+        if isinstance(servers, str):
+            servers = [s.strip() for s in servers.split(",") if s.strip()]
+        if isinstance(servers, list):
+            opts.mcp_servers = list(servers)
+        elif isinstance(servers, dict):
+            opts.mcp_servers = [{"name": k, **v} for k, v in servers.items() if isinstance(v, dict)]
+        if isinstance(extension.get("effort"), str):
+            opts.effort = extension["effort"]
+        if isinstance(extension.get("workspace"), str):
+            opts.workspace = extension["workspace"]
+        if isinstance(extension.get("permissions"), str):
+            opts.permissions = extension["permissions"].strip().lower()
     agent = request.headers.get("x-kiro-agent")
     effort = request.headers.get("x-kiro-effort")
     permissions = request.headers.get("x-kiro-permissions")
@@ -120,6 +153,9 @@ def header_options(request: Request, opts: TurnOptions) -> TurnOptions:
     workspace = request.headers.get("x-kiro-workspace")
     if workspace:
         opts.workspace = workspace.strip()
+    header_servers = request.headers.get("x-kiro-mcp-servers")
+    if header_servers:
+        opts.mcp_servers = [s.strip() for s in header_servers.split(",") if s.strip()]
     opts.request_id = request.headers.get("x-request-id") or new_id("req_")
     return opts
 

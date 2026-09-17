@@ -157,6 +157,7 @@ class KiroAgent:
         effort: str | None = None,
         autopilot: bool | None = None,
         timeout: float = 120.0,
+        meta: JSON | None = None,
         _attempt: int = 0,
     ) -> Session:
         """Create a session and apply model/mode/effort/autopilot settings.
@@ -168,11 +169,11 @@ class KiroAgent:
         ``config_option_update`` and, failing that, is replaced by a fresh one.
         """
         session_cwd = os.path.abspath(cwd or self.cwd)
-        result = await self.client.request(
-            "session/new",
-            {"cwd": session_cwd, "mcpServers": mcp_servers or []},
-            timeout=timeout,
-        )
+        params: JSON = {"cwd": session_cwd, "mcpServers": mcp_servers or []}
+        if meta:
+            # v3: ``_meta.kiro.customAgents`` registers inline agents as selectable modes.
+            params["_meta"] = meta
+        result = await self.client.request("session/new", params, timeout=timeout)
         if not isinstance(result, dict) or not result.get("sessionId"):
             raise ACPError(f"session/new returned no sessionId: {result!r}")
         session = Session(
@@ -198,6 +199,7 @@ class KiroAgent:
                         effort=effort,
                         autopilot=autopilot,
                         timeout=timeout,
+                        meta=meta,
                         _attempt=_attempt + 1,
                     )
                 LOG.warning(

@@ -310,6 +310,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                 stop_sequences=stop_list(body.get("stop_sequences")),
                 max_tokens=int_or_none(body.get("max_tokens")),
             ),
+            body=body,
         )
         message_id = new_id("msg_")
         show_thoughts = backend.settings.expose_thoughts and thinking_requested(body)
