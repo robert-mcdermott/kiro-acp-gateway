@@ -471,6 +471,7 @@ class KiroBackend:
                 max_tokens=opts.max_tokens if self.settings.enforce_max_tokens else None,
             )
             text_parts: list[str] = []
+            trailing_parts: list[str] = []
             thought_parts: list[str] = []
             calls: list[ToolCallPart] = []
             kiro_meta: JSON = {
@@ -497,6 +498,11 @@ class KiroBackend:
                                 text, new_calls = parser.feed(chunk)
                                 if text and limiter.active:
                                     text = limiter.feed(text)
+                                if text and calls:
+                                    # Text after a tool call is the model guessing at the
+                                    # result; the harness will supply the real one.
+                                    trailing_parts.append(text)
+                                    text = ""
                                 if text:
                                     text_parts.append(text)
                                     yield OutputText(text)
@@ -533,6 +539,9 @@ class KiroBackend:
                                 tail, tail_calls = parser.flush()
                                 if limiter.active:
                                     tail = (limiter.feed(tail) if tail else "") + limiter.flush()
+                                if tail and calls:
+                                    trailing_parts.append(tail)
+                                    tail = ""
                                 if tail:
                                     text_parts.append(tail)
                                     yield OutputText(tail)
@@ -548,6 +557,12 @@ class KiroBackend:
                 text = "".join(text_parts)
                 if calls:
                     text = text.rstrip()
+                if trailing_parts:
+                    kiro_meta["dropped_text_after_tool_calls"] = "".join(trailing_parts)
+                    LOG.debug(
+                        "Dropped %d chars of text after tool calls",
+                        len(kiro_meta["dropped_text_after_tool_calls"]),
+                    )
                 thoughts = "".join(thought_parts)
                 usage = self._usage(conversation, text, thoughts, calls)
                 fingerprint = None
@@ -662,6 +677,9 @@ def normalize_model_name(name: str) -> str:
     import re
 
     value = name.strip().lower()
+    # A "kiro-"/"kiro/" prefix lets clients such as Codex see a name outside their own
+    # model catalogue (Codex switches to a lite wire format for names it recognizes).
+    value = re.sub(r"^kiro[-/:]", "", value)
     value = re.sub(r"-(\d{8})$", "", value)
     value = re.sub(r"-(latest|preview)$", "", value)
     value = re.sub(r"@\d+$", "", value)

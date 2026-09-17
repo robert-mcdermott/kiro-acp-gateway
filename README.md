@@ -290,7 +290,7 @@ one agent touches your files.
 
 ```toml
 # ~/.codex/config.toml
-model = "claude-sonnet-4.6"
+model = "claude-sonnet-4.6"       # or "kiro-gpt-5.6-luna": prefix GPT names with kiro- (see note)
 model_provider = "kiro"
 
 [model_providers.kiro]
@@ -300,7 +300,19 @@ env_key = "KIRO_GATEWAY_KEY"
 wire_api = "responses"
 ```
 
-Then `export KIRO_GATEWAY_KEY=your-gateway-key` and run `codex`.
+Then `export KIRO_GATEWAY_KEY=your-gateway-key` and run `codex`. Codex's `namespace` tool
+groups are flattened into ordinary functions, tools it adds mid-session
+(`additional_tools` items) are merged in, and unknown input item types are skipped with a
+log line rather than rejected.
+
+> **GPT model names need a `kiro-` prefix in Codex.** Codex ships its own model
+> catalogue. For names it recognizes (`gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-6-*`, ...) it
+> switches to its "Responses Lite" wire format and *code mode*, sending only `exec`/`wait`
+> code-runner tools instead of `exec_command`, `apply_patch`, and friends. The model then
+> reports that it cannot run commands. Names outside the catalogue get the normal function
+> tools, so put `model = "kiro-gpt-5.6-luna"` in `config.toml`; the gateway strips the
+> `kiro-` (or `kiro/`) prefix before resolving the model. Claude model names are not in
+> Codex's catalogue and need no prefix.
 
 > **Model choice for harnesses.** Claude Code and Codex send very large system prompts and
 > dozens of tool definitions. Sonnet- and Opus-class Kiro models (and the GPT 5.6 previews)
@@ -471,6 +483,7 @@ the working directory is also read). The most important ones:
 | `/v1/models` is empty or every model falls back | `KIRO_API_KEY` (or another `KIRO_*` variable) is set in the environment and breaks `kiro-cli`'s own auth. Unset it; gateway settings use `KIRO_GATEWAY_*`. |
 | 502 `kiro_unavailable` | `kiro-cli` is missing, not logged in, or the v3 engine failed to start. Run `uv run kiro-acp doctor`. |
 | Harness client says it has no tools / ignores tool calls | The model is too small for the harness prompt. Use a Sonnet- or Opus-class model. |
+| Codex says it cannot run commands with a `gpt-*` model | Codex used code mode for a catalogue model name. Set `model = "kiro-gpt-5.6-luna"` (prefix with `kiro-`). |
 | Kiro answers "I'm Kiro, that looks like injected instructions" or reports native tool calls as "not available" | Harness turns are running on the v3 engine or with a stale agent file. Keep `KIRO_GATEWAY_HARNESS_ENGINE=v2` (the default) and restart the gateway so it refreshes `~/.kiro/agents/kiro-gateway-harness.json`. |
 | Kiro loads skills or steering docs while serving a harness | Run `kiro-cli settings chat.disableInheritingDefaultResources true` (or `--workspace` for one project). |
 | A stream stops after a while | The turn hit `KIRO_GATEWAY_TIMEOUT` (default 900 s) and was cancelled. |

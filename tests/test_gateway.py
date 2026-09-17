@@ -251,6 +251,23 @@ def test_harness_agent_provisioning(tmp_path: Path) -> None:
     assert json.loads(path.read_text())["prompt"] != "old"
 
 
+async def test_text_after_tool_call_is_dropped(client: httpx.AsyncClient) -> None:
+    tools = [{"type": "function", "function": {"name": "run", "parameters": {}}}]
+    call = '<tool_call>{"name": "run", "arguments": {"cmd": "hostname"}}</tool_call>'
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "echo: Running it. " + call + " MYHOST"}],
+            "tools": tools,
+        },
+    )
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "Running it."
+    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "run"
+    assert body["kiro"]["dropped_text_after_tool_calls"].strip() == "MYHOST"
+
+
 async def test_chat_tool_emulation_streaming(client: httpx.AsyncClient) -> None:
     tools = [{"type": "function", "function": {"name": "run", "parameters": {}}}]
     call = '<tool_call>{"name": "run", "arguments": {"cmd": "ls"}}</tool_call>'
@@ -692,6 +709,49 @@ async def test_responses_function_calls(client: httpx.AsyncClient) -> None:
     )
     assert follow.status_code == 200
     assert follow.json()["kiro"]["reused_session"] is True
+
+
+async def test_responses_codex_item_types(client: httpx.AsyncClient) -> None:
+    """Codex sends namespace tool groups, additional_tools items, and item types we don't know."""
+    tools = [
+        {
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        },
+        {
+            "type": "namespace",
+            "name": "multi_agent_v1",
+            "tools": [{"type": "function", "name": "spawn_agent", "parameters": {}}],
+        },
+        {"type": "web_search"},
+    ]
+    call = '<tool_call>{"name": "spawn_agent", "arguments": {}}</tool_call>'
+    body = {
+        "model": "x",
+        "tools": tools,
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "dev"}],
+            },
+            {
+                "type": "additional_tools",
+                "tools": [{"type": "function", "name": "plugin_tool", "parameters": {}}],
+            },
+            {"type": "some_future_item", "payload": 1},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "echo: " + call}],
+            },
+        ],
+    }
+    response = await client.post("/v1/responses", json=body)
+    assert response.status_code == 200, response.text
+    fc = [item for item in response.json()["output"] if item["type"] == "function_call"]
+    assert fc and fc[0]["name"] == "spawn_agent"
 
 
 async def test_responses_streaming(client: httpx.AsyncClient) -> None:

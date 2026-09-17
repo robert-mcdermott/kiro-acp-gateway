@@ -69,12 +69,14 @@ class ResponseStore:
 STORE = ResponseStore()
 
 
-def parse_input(conversation: Conversation, value: Any) -> None:
+def parse_input(conversation: Conversation, value: Any) -> list[ToolDef]:
+    """Fold ``input`` into the conversation; returns tools declared inline (``additional_tools``)."""
+    extra_tools: list[ToolDef] = []
     if value is None:
-        return
+        return extra_tools
     if isinstance(value, str):
         conversation.messages.append(Message("user", [TextPart(value)]))
-        return
+        return extra_tools
     if not isinstance(value, list):
         raise GatewayError("'input' must be a string or an array of items", code="invalid_input")
     for item in value:
@@ -119,6 +121,9 @@ def parse_input(conversation: Conversation, value: Any) -> None:
                 conversation.messages[-1].parts.append(result)
             else:
                 conversation.messages.append(Message("tool", [result]))
+        elif kind == "additional_tools":
+            # Codex TUI adds plugin/skill tools mid-conversation as an input item.
+            extra_tools.extend(parse_tools({"tools": item.get("tools") or []}))
         elif kind in (
             "reasoning",
             "item_reference",
@@ -128,7 +133,8 @@ def parse_input(conversation: Conversation, value: Any) -> None:
         ):
             continue
         else:
-            raise GatewayError(f"Unsupported input item type {kind!r}", code="invalid_input")
+            LOG.warning("Ignoring unsupported Responses input item type %r", kind)
+    return extra_tools
 
 
 def message_parts(content: Any) -> list[Part]:
@@ -161,7 +167,13 @@ def message_parts(content: Any) -> list[Part]:
 def parse_tools(body: JSON) -> list[ToolDef]:
     tools: list[ToolDef] = []
     for raw in body.get("tools") or []:
-        if not isinstance(raw, dict) or raw.get("type") != "function":
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("type") == "namespace" and isinstance(raw.get("tools"), list):
+            # Codex groups related functions under a namespace; expose them by their own names.
+            tools.extend(parse_tools({"tools": raw["tools"]}))
+            continue
+        if raw.get("type") != "function":
             continue
         name = raw.get("name") or (raw.get("function") or {}).get("name")
         if not name:
@@ -218,10 +230,12 @@ def build_conversation(body: JSON) -> Conversation:
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
         conversation.system = instructions
-    parse_input(conversation, body.get("input"))
+    extra_tools = parse_input(conversation, body.get("input"))
     if not conversation.messages:
         raise GatewayError("'input' is required", code="invalid_input")
     conversation.tools = parse_tools(body)
+    known = {t.name for t in conversation.tools}
+    conversation.tools.extend(t for t in extra_tools if t.name not in known)
     conversation.tool_choice = parse_tool_choice(body.get("tool_choice"))
     conversation.json_output = parse_text_format(body)
     reasoning = body.get("reasoning")

@@ -70,6 +70,8 @@ def test_normalize_model_name() -> None:
     assert normalize_model_name("claude-opus-4.6") == "claude-opus-4.6"
     assert normalize_model_name("Claude-Sonnet-4-6-latest") == "claude-sonnet-4.6"
     assert normalize_model_name("gpt-5.6-terra") == "gpt-5.6-terra"
+    assert normalize_model_name("kiro-gpt-5.6-luna") == "gpt-5.6-luna"
+    assert normalize_model_name("kiro/claude-sonnet-4-6") == "claude-sonnet-4.6"
 
 
 def test_fingerprint_matches_after_echo() -> None:
