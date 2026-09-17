@@ -273,6 +273,14 @@ class Agent:
             return {"stopReason": "end_turn"}
         if text == "error":
             raise RpcError(-32603, "Internal error", "Encountered an error in the response stream")
+        if text.startswith("error:"):
+            raise RpcError(-32603, "Internal error", text[len("error:") :])
+        if text.startswith("sleep:"):
+            await say("before ")
+            await asyncio.sleep(float(text[len("sleep:") :]))
+            await say("after")
+            await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 1})
+            return {"stopReason": "end_turn"}
         if text == "crash":
             await say("about to")
             os._exit(3)

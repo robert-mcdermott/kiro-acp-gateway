@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from kiro_acp.acp.session import image_block, text_block
 from kiro_acp.gateway.conversation import (
@@ -14,7 +15,10 @@ from kiro_acp.gateway.conversation import (
     ToolCallPart,
     ToolResultPart,
 )
+from kiro_acp.gateway.sanitizer import sanitize_system
 from kiro_acp.gateway.toolcalls import render_tool_call, tool_instructions, tool_reminder
+
+LOG = logging.getLogger("kiro_acp.gateway.prompting")
 
 HARNESS_PREAMBLE = (
     "This is an API request relayed by kiro-gateway from an external coding tool. Answer the "
@@ -28,12 +32,17 @@ TRANSCRIPT_NOTE = (
 )
 
 
-def build_system_text(conversation: Conversation, *, emulate_tools: bool) -> str:
+def build_system_text(
+    conversation: Conversation, *, emulate_tools: bool, sanitize: bool = False
+) -> str:
     sections: list[str] = [HARNESS_PREAMBLE]
-    if conversation.system.strip():
-        sections.append(
-            "<operator_instructions>\n" + conversation.system.strip() + "\n</operator_instructions>"
-        )
+    system = conversation.system.strip()
+    if system and sanitize:
+        system, removed = sanitize_system(system)
+        if removed:
+            LOG.info("Sanitized client system prompt: removed %d line(s)", removed)
+    if system.strip():
+        sections.append("<operator_instructions>\n" + system.strip() + "\n</operator_instructions>")
     if emulate_tools and conversation.tools and conversation.tool_choice.mode != "none":
         sections.append(
             "<tools>\n"
@@ -89,6 +98,7 @@ def render_prompt(
     start: int,
     include_system: bool,
     emulate_tools: bool,
+    sanitize: bool = False,
 ) -> list[JSON]:
     """Build ``session/prompt`` blocks for messages ``conversation.messages[start:]``.
 
@@ -98,7 +108,9 @@ def render_prompt(
     blocks: list[JSON] = []
     sections: list[str] = []
     if include_system:
-        sections.append(build_system_text(conversation, emulate_tools=emulate_tools))
+        sections.append(
+            build_system_text(conversation, emulate_tools=emulate_tools, sanitize=sanitize)
+        )
     messages = conversation.messages
     if include_system and start > 0:
         # Fresh session but the client already has history: replay it as a transcript.

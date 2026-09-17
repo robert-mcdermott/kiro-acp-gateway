@@ -34,6 +34,7 @@ from kiro_acp.acp.types import ModelInfo, ToolCallStatus
 from kiro_acp.gateway.config import Settings
 from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart
 from kiro_acp.gateway.harness_agent import ensure_harness_agent
+from kiro_acp.gateway.limits import StreamLimiter
 from kiro_acp.gateway.prompting import assistant_message, render_prompt
 from kiro_acp.gateway.toolcalls import ToolCallParser
 from kiro_acp.gateway.turn import (
@@ -58,12 +59,57 @@ class GatewayError(Exception):
         status: int = 400,
         error_type: str | None = None,
         code: str | None = None,
+        retry_after: int | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status = status
         self.error_type = error_type or ("invalid_request_error" if status < 500 else "api_error")
         self.code = code
+        self.retry_after = retry_after
+
+    @classmethod
+    def from_kiro(cls, message: str) -> GatewayError:
+        """Classify a Kiro-side failure so SDK retry logic behaves sensibly."""
+        status, error_type, code, retry_after = classify_kiro_error(message)
+        return cls(
+            message, status=status, error_type=error_type, code=code, retry_after=retry_after
+        )
+
+
+_ERROR_RULES: list[tuple[tuple[str, ...], int, str, str, int | None]] = [
+    (
+        ("throttl", "rate limit", "too many requests", "quota", "429", "slow down"),
+        429,
+        "rate_limit_error",
+        "rate_limited",
+        30,
+    ),
+    (
+        ("overloaded", "capacity", "unavailable", "not available", "503", "temporarily"),
+        503,
+        "overloaded_error",
+        "kiro_unavailable",
+        10,
+    ),
+    (("timed out", "timeout", "deadline"), 504, "api_error", "kiro_timeout", None),
+    (
+        ("unauthorized", "not logged in", "expired token", "authentication"),
+        502,
+        "api_error",
+        "kiro_auth",
+        None,
+    ),
+]
+
+
+def classify_kiro_error(message: str) -> tuple[int, str, str, int | None]:
+    """Map Kiro error text to (status, error_type, code, retry_after)."""
+    lowered = message.lower()
+    for needles, status, error_type, code, retry_after in _ERROR_RULES:
+        if any(needle in lowered for needle in needles):
+            return status, error_type, code, retry_after
+    return 502, "api_error", "kiro_error", None
 
 
 @dataclass(slots=True)
@@ -76,6 +122,8 @@ class TurnOptions:
     permissions: str | None = None
     emulate_tools: bool = False
     request_id: str = ""
+    stop_sequences: list[str] = field(default_factory=list)
+    max_tokens: int | None = None
 
 
 @dataclass
@@ -112,6 +160,7 @@ class KiroBackend:
         self._models_at = 0.0
         self._models_lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
+        self._warmup: asyncio.Task[None] | None = None
         self.started = False
 
     # ------------------------------------------------------------------ lifecycle
@@ -126,9 +175,26 @@ class KiroBackend:
                 )
         self.started = True
         self._reaper = asyncio.create_task(self._reap_idle(), name="kiro-session-reaper")
+        if self.settings.warmup:
+            self._warmup = asyncio.create_task(self._warm_up(), name="kiro-warmup")
+
+    async def _warm_up(self) -> None:
+        try:
+            models = await self.models()
+            LOG.info(
+                "Model catalogue loaded: %d models (default %s)", len(models), self._default_model
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOG.warning("Model warm-up failed: %s", error)
 
     async def stop(self) -> None:
         self.started = False
+        if self._warmup is not None and not self._warmup.done():
+            self._warmup.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._warmup
         if self._reaper is not None:
             self._reaper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -189,7 +255,11 @@ class KiroBackend:
         if not requested:
             return await self.default_model()
         if not ids:
-            return requested if requested.lower() not in ("kiro", "default", "auto") else None
+            return (
+                requested
+                if requested.lower() not in ("kiro", "default", "auto", "claude-auto")
+                else None
+            )
         if requested in ids:
             return requested
         alias = self.settings.alias_for(requested)
@@ -202,7 +272,7 @@ class KiroBackend:
         for candidate in ids:
             if normalized and normalize_model_name(candidate).startswith(normalized):
                 return candidate
-        if requested.lower() in ("kiro", "default", "auto"):
+        if requested.lower() in ("kiro", "default", "auto", "claude-auto"):
             return await self.default_model()
         if self.settings.model_fallback:
             fallback = await self.default_model()
@@ -389,9 +459,17 @@ class KiroBackend:
                 " (reused)" if not fresh else "",
             )
             blocks = render_prompt(
-                conversation, start=start, include_system=fresh, emulate_tools=opts.emulate_tools
+                conversation,
+                start=start,
+                include_system=fresh,
+                emulate_tools=opts.emulate_tools,
+                sanitize=self.settings.sanitize_system,
             )
             parser = ToolCallParser(enabled=opts.emulate_tools)
+            limiter = StreamLimiter(
+                stop_sequences=[seq for seq in opts.stop_sequences if seq],
+                max_tokens=opts.max_tokens if self.settings.enforce_max_tokens else None,
+            )
             text_parts: list[str] = []
             thought_parts: list[str] = []
             calls: list[ToolCallPart] = []
@@ -414,7 +492,11 @@ class KiroBackend:
                     async for event in turn:
                         match event:
                             case TextDelta(text=chunk):
+                                if limiter.hit:
+                                    continue
                                 text, new_calls = parser.feed(chunk)
+                                if text and limiter.active:
+                                    text = limiter.feed(text)
                                 if text:
                                     text_parts.append(text)
                                     yield OutputText(text)
@@ -422,6 +504,13 @@ class KiroBackend:
                                     part = parsed.to_part()
                                     calls.append(part)
                                     yield OutputToolCall(part)
+                                if limiter.hit:
+                                    LOG.info(
+                                        "Turn %s hit %s limit; cancelling Kiro",
+                                        opts.request_id,
+                                        limiter.hit,
+                                    )
+                                    await session.cancel()
                             case ThoughtDelta(text=chunk):
                                 if self.settings.expose_thoughts:
                                     thought_parts.append(chunk)
@@ -442,6 +531,8 @@ class KiroBackend:
                             case TurnComplete(stop_reason=stop, error=turn_error):
                                 completed = True
                                 tail, tail_calls = parser.flush()
+                                if limiter.active:
+                                    tail = (limiter.feed(tail) if tail else "") + limiter.flush()
                                 if tail:
                                     text_parts.append(tail)
                                     yield OutputText(tail)
@@ -450,6 +541,10 @@ class KiroBackend:
                                     calls.append(part)
                                     yield OutputToolCall(part)
                                 finish, error = map_stop(stop, turn_error, bool(calls))
+                                if limiter.hit == "stop":
+                                    finish, error = "stop", None
+                                elif limiter.hit == "length":
+                                    finish, error = "length", None
                 text = "".join(text_parts)
                 if calls:
                     text = text.rstrip()
@@ -467,6 +562,7 @@ class KiroBackend:
                     kiro=kiro_meta,
                     error=error,
                     session_id=session.session_id,
+                    stop_sequence=limiter.stop_sequence,
                 )
             finally:
                 if not completed:
@@ -477,6 +573,9 @@ class KiroBackend:
                     )
                     with contextlib.suppress(Exception):
                         await session.cancel()
+                    await self._release(pooled, None, keep=False)
+                elif limiter.hit:
+                    # Kiro's history holds the untruncated reply; do not reuse this session.
                     await self._release(pooled, None, keep=False)
                 else:
                     await self._release(

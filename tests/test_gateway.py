@@ -89,11 +89,16 @@ async def test_health_and_auth(client: httpx.AsyncClient) -> None:
 async def test_models_openai_and_anthropic(client: httpx.AsyncClient) -> None:
     openai = (await client.get("/v1/models")).json()
     assert openai["object"] == "list"
-    assert [m["id"] for m in openai["data"]] == [
-        "claude-haiku-4.5",
-        "claude-sonnet-4.6",
-        "gpt-5.6-terra",
-    ]
+    ids = [m["id"] for m in openai["data"]]
+    assert ids[:3] == ["claude-haiku-4.5", "claude-sonnet-4.6", "gpt-5.6-terra"]
+    assert {"claude-haiku-4-5", "claude-sonnet-4-6", "gpt-5-6-terra", "claude-auto", "auto"} <= set(
+        ids
+    )
+    auto = await client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-auto", "messages": [{"role": "user", "content": "who"}]},
+    )
+    assert auto.json()["choices"][0]["message"]["content"].startswith("[claude-haiku-4.5]")
     anthropic = (await client.get("/v1/models", headers={"anthropic-version": "2023-06-01"})).json()
     assert anthropic["data"][0]["type"] == "model"
     one = await client.get("/v1/models/claude-sonnet-4-6-20260101")
@@ -445,6 +450,167 @@ async def test_permission_header_requires_opt_in(client: httpx.AsyncClient) -> N
         headers={"X-Kiro-Permissions": "deny"},
     )
     assert response.status_code == 403
+
+
+# --------------------------------------------------------------------------- reliability (roadmap P1)
+
+
+async def test_sse_keepalive_during_silence(workspace: Path, engine: str) -> None:
+    settings = make_settings(workspace, engine=engine, sse_keepalive=0.2)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=30,
+        ) as http,
+    ):
+        chat = await http.post(
+            "/v1/chat/completions",
+            json={
+                "model": "x",
+                "messages": [{"role": "user", "content": "sleep:0.9"}],
+                "stream": True,
+            },
+        )
+        assert chat.text.count(": keepalive") >= 2
+        chunks = [e[1] for e in sse_events(chat.text) if isinstance(e[1], dict)]
+        assert (
+            "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c["choices"])
+            == "before after"
+        )
+        msg = await http.post(
+            "/v1/messages",
+            headers=ANTHROPIC_HEADERS,
+            json={
+                "model": "x",
+                "max_tokens": 10,
+                "stream": True,
+                "messages": [{"role": "user", "content": "sleep:0.9"}],
+            },
+        )
+        names = [e[0] for e in sse_events(msg.text)]
+        assert names.count("ping") >= 3 and names[-1] == "message_stop"
+
+
+async def test_error_classification_and_retry_after(client: httpx.AsyncClient) -> None:
+    throttled = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "error:Request throttled, too many requests"}],
+        },
+    )
+    assert throttled.status_code == 429
+    assert throttled.headers.get("retry-after") == "30"
+    assert throttled.json()["error"]["type"] == "rate_limit_error"
+    unavailable = await client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={
+            "model": "x",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "error:The model is not available right now"}],
+        },
+    )
+    assert (
+        unavailable.status_code == 503 and unavailable.json()["error"]["type"] == "overloaded_error"
+    )
+    streamed = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "error:upstream timed out"}],
+            "stream": True,
+        },
+    )
+    errors = [
+        e[1]["error"]
+        for e in sse_events(streamed.text)
+        if isinstance(e[1], dict) and "error" in e[1]
+    ]
+    assert errors and errors[0]["code"] == "kiro_timeout"
+
+
+async def test_stop_sequences_enforced(client: httpx.AsyncClient) -> None:
+    chat = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "echo: one two three four"}],
+            "stop": ["three"],
+        },
+    )
+    body = chat.json()
+    assert body["choices"][0]["message"]["content"] == "one two "
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["kiro"]["reused_session"] is False
+    msg = await client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={
+            "model": "x",
+            "max_tokens": 100,
+            "stop_sequences": ["two"],
+            "stream": True,
+            "messages": [{"role": "user", "content": "echo: one two three"}],
+        },
+    )
+    events = sse_events(msg.text)
+    text = "".join(
+        e[1]["delta"]["text"]
+        for e in events
+        if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "text_delta"
+    )
+    assert text == "one "
+    delta = next(e[1] for e in events if e[0] == "message_delta")
+    assert delta["delta"] == {"stop_reason": "stop_sequence", "stop_sequence": "two"}
+
+
+async def test_max_tokens_enforced_when_enabled(workspace: Path, engine: str) -> None:
+    settings = make_settings(workspace, engine=engine, enforce_max_tokens=True)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=30,
+        ) as http,
+    ):
+        response = await http.post(
+            "/v1/chat/completions",
+            json={"model": "x", "messages": [{"role": "user", "content": "long"}], "max_tokens": 5},
+        )
+        body = response.json()
+        assert len(body["choices"][0]["message"]["content"]) == 20
+        assert body["choices"][0]["finish_reason"] == "length"
+        anthropic = await http.post(
+            "/v1/messages",
+            headers=ANTHROPIC_HEADERS,
+            json={"model": "x", "max_tokens": 5, "messages": [{"role": "user", "content": "long"}]},
+        )
+        assert anthropic.json()["stop_reason"] == "max_tokens"
+
+
+async def test_unsupported_endpoints_return_501(client: httpx.AsyncClient) -> None:
+    response = await client.post("/v1/embeddings", json={"model": "x", "input": "hi"})
+    assert response.status_code == 501
+    assert response.json()["error"]["code"] == "not_implemented"
+    assert (await client.get("/v1/files")).status_code == 501
+
+
+async def test_warmup_loads_models(client: httpx.AsyncClient) -> None:
+    import asyncio
+
+    for _ in range(50):
+        if client.app.state.backend.health()["models_cached"]:  # type: ignore[attr-defined]
+            break
+        await asyncio.sleep(0.1)
+    assert client.app.state.backend.health()["models_cached"] == 3  # type: ignore[attr-defined]
 
 
 # --------------------------------------------------------------------------- legacy completions

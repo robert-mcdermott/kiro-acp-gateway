@@ -90,7 +90,7 @@ def add_permission_options(parser: argparse.ArgumentParser, *, default: str) -> 
         action="append",
         default=[],
         metavar="RULE",
-        help="allow rule, e.g. 'kind=read,search' or 'tool=shell;title=Running: ls*' (repeatable)",
+        help="allow rule: 'kind=read,search', 'tool=shell;title=Running: ls*', or Claude Code style 'Bash(git status*)' / 'Read(/etc/*)' (repeatable)",
     )
     group.add_argument(
         "--deny",

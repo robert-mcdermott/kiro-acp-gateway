@@ -28,10 +28,12 @@ from kiro_acp.gateway.conversation import (
 from kiro_acp.gateway.protocols.common import (
     header_options,
     image_from_data_url,
+    int_or_none,
     new_id,
     read_json,
     sse,
     sse_response,
+    stop_list,
 )
 from kiro_acp.gateway.turn import (
     OutputDone,
@@ -299,7 +301,14 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
         if backend.settings.tool_mode == "ignore":
             emulate = False
         opts = header_options(
-            request, TurnOptions(model=model, effort=conversation.effort, emulate_tools=emulate)
+            request,
+            TurnOptions(
+                model=model,
+                effort=conversation.effort,
+                emulate_tools=emulate,
+                stop_sequences=stop_list(body.get("stop_sequences")),
+                max_tokens=int_or_none(body.get("max_tokens")),
+            ),
         )
         message_id = new_id("msg_")
         show_thoughts = backend.settings.expose_thoughts and thinking_requested(body)
@@ -309,7 +318,9 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
             return sse_response(
                 stream_messages(
                     backend, conversation, opts, message_id, display_model, show_thoughts
-                )
+                ),
+                keepalive=backend.settings.sse_keepalive,
+                ping=sse({"type": "ping"}, "ping"),
             )
 
         text = ""
@@ -329,12 +340,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                         done = event
         assert done is not None
         if done.finish == "error":
-            raise GatewayError(
-                done.error or "Kiro turn failed",
-                status=502,
-                error_type="api_error",
-                code="kiro_error",
-            )
+            raise GatewayError.from_kiro(done.error or "Kiro turn failed")
         text, thoughts, calls = done.text, done.thoughts, done.tool_calls
         content: list[JSON] = []
         if thoughts and show_thoughts:
@@ -352,8 +358,8 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                 "role": "assistant",
                 "model": display_model,
                 "content": content,
-                "stop_reason": stop_reason(done.finish),
-                "stop_sequence": None,
+                "stop_reason": "stop_sequence" if done.stop_sequence else stop_reason(done.finish),
+                "stop_sequence": done.stop_sequence,
                 "usage": usage_json(done.usage),
                 "kiro": done.kiro,
             }
@@ -500,8 +506,10 @@ async def stream_messages(
                             {
                                 "type": "message_delta",
                                 "delta": {
-                                    "stop_reason": stop_reason(finish),
-                                    "stop_sequence": None,
+                                    "stop_reason": "stop_sequence"
+                                    if event.stop_sequence
+                                    else stop_reason(finish),
+                                    "stop_sequence": event.stop_sequence,
                                 },
                                 "usage": {
                                     "output_tokens": usage.get("completion_tokens", 0),

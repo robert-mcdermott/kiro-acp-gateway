@@ -124,6 +124,42 @@ async def test_permission_rules(workspace: Path, engine: str) -> None:
         assert result.permissions[0].reason == "rule:allow"
 
 
+def test_claude_code_style_rules() -> None:
+    from kiro_acp.acp.types import PermissionRequest, ToolKind
+
+    def request(
+        title: str, kind: str, raw: dict, tool_name: str | None = None
+    ) -> PermissionRequest:
+        return PermissionRequest(
+            session_id="s",
+            tool_call_id="c",
+            title=title,
+            kind=ToolKind(kind),
+            tool_name=tool_name,
+            raw_input=raw,
+            options=[],
+            raw={},
+        )
+
+    ls = request("Running: ls -la", "execute", {"command": "ls -la"}, "shell")
+    rm = request("Running: rm -rf /", "execute", {"command": "rm -rf /"}, "shell")
+    read_etc = request("Reading /etc/passwd", "read", {"path": "/etc/passwd"}, "read")
+    write_src = request("Creating src/a.py", "edit", {"path": "src/a.py"}, "write")
+    assert PermissionRule.parse("allow:Bash(ls*)").matches(ls)
+    assert not PermissionRule.parse("allow:Bash(ls*)").matches(rm)
+    assert PermissionRule.parse("deny:Bash(rm *)").matches(rm)
+    assert PermissionRule.parse("allow:Bash").matches(rm) and not PermissionRule.parse(
+        "allow:Bash"
+    ).matches(read_etc)
+    assert PermissionRule.parse("deny:Read(/etc/*)").matches(read_etc)
+    assert PermissionRule.parse("allow:Write(src/*)").matches(write_src)
+    assert not PermissionRule.parse("allow:Edit(tests/*)").matches(write_src)
+    mcp = request("query", "other", {}, "@db/query")
+    assert PermissionRule.parse("allow:mcp__db__query").matches(mcp)
+    with pytest.raises(ValueError, match="Unknown tool"):
+        PermissionRule.parse("allow:Teleport(x)")
+
+
 async def test_ask_callback(workspace: Path, engine: str) -> None:
     seen = []
 

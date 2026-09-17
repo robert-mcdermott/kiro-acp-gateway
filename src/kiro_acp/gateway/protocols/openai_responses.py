@@ -28,6 +28,7 @@ from kiro_acp.gateway.conversation import (
 from kiro_acp.gateway.protocols.common import (
     header_options,
     image_from_data_url,
+    int_or_none,
     json_dumps,
     new_id,
     now,
@@ -314,7 +315,13 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
         if backend.settings.tool_mode == "ignore":
             emulate = False
         opts = header_options(
-            request, TurnOptions(model=model, effort=conversation.effort, emulate_tools=emulate)
+            request,
+            TurnOptions(
+                model=model,
+                effort=conversation.effort,
+                emulate_tools=emulate,
+                max_tokens=int_or_none(body.get("max_output_tokens")),
+            ),
         )
         response_id = new_id("resp_")
         created = now()
@@ -322,7 +329,10 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
         store = body.get("store", True) is not False
 
         if body.get("stream"):
-            return sse_response(stream_response(backend, conversation, opts, response, store))
+            return sse_response(
+                stream_response(backend, conversation, opts, response, store),
+                keepalive=backend.settings.sse_keepalive,
+            )
 
         text = ""
         thoughts = ""
@@ -341,12 +351,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                         done = event
         assert done is not None
         if done.finish == "error":
-            raise GatewayError(
-                done.error or "Kiro turn failed",
-                status=502,
-                error_type="api_error",
-                code="kiro_error",
-            )
+            raise GatewayError.from_kiro(done.error or "Kiro turn failed")
         text, thoughts, calls = done.text, done.thoughts, done.tool_calls
         finalize(response, text, thoughts, calls, done, backend.settings.expose_thoughts)
         if store:

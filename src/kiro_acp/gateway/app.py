@@ -141,6 +141,28 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
         # Claude Code probes this path to check connectivity.
         return {"ok": True}
 
+    for unsupported in (
+        "/v1/embeddings",
+        "/v1/audio/{rest:path}",
+        "/v1/images/{rest:path}",
+        "/v1/files",
+        "/v1/files/{rest:path}",
+        "/v1/batches",
+        "/v1/batches/{rest:path}",
+        "/v1/fine_tuning/{rest:path}",
+        "/v1/moderations",
+    ):
+
+        async def not_implemented(request: Request, rest: str = ""):
+            raise GatewayError(
+                f"{request.url.path} is not supported: this gateway only relays chat, responses, completions, and messages to Kiro",
+                status=501,
+                error_type="not_supported_error",
+                code="not_implemented",
+            )
+
+        app.add_api_route(unsupported, not_implemented, methods=["GET", "POST", "DELETE"])
+
     @app.get("/")
     async def index():
         return {
@@ -175,11 +197,15 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
             LOG.error(
                 "%s %s -> %s: %s", request.method, request.url.path, error.status, error.message
             )
-        headers = {"WWW-Authenticate": "Bearer"} if error.status == 401 else None
+        headers: dict[str, str] = {}
+        if error.status == 401:
+            headers["WWW-Authenticate"] = "Bearer"
+        if error.retry_after:
+            headers["Retry-After"] = str(error.retry_after)
         return JSONResponse(
             error_body(request, error.message, error.error_type, error.code),
             status_code=error.status,
-            headers=headers,
+            headers=headers or None,
         )
 
     @app.exception_handler(RequestValidationError)

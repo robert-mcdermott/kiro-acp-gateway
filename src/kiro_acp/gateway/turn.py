@@ -36,6 +36,7 @@ class OutputDone:
     kiro: JSON = field(default_factory=dict)
     error: str | None = None
     session_id: str | None = None
+    stop_sequence: str | None = None
 
 
 OutputEvent = OutputText | OutputThought | OutputToolCall | OutputDone

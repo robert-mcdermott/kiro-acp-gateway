@@ -13,11 +13,14 @@ from kiro_acp.gateway.backend import GatewayError, KiroBackend, TurnOptions
 from kiro_acp.gateway.conversation import JSON, Conversation, Message, TextPart
 from kiro_acp.gateway.protocols.common import (
     header_options,
+    int_or_none,
     new_id,
     now,
     read_json,
     sse,
     sse_response,
+    stop_list,
+    stream_error_body,
 )
 from kiro_acp.gateway.protocols.openai_chat import finish_reason, usage_json
 from kiro_acp.gateway.turn import OutputDone, OutputText
@@ -52,7 +55,14 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
         conversation = Conversation(system=system, messages=[Message("user", [TextPart(prompt)])])
         model_name = str(body.get("model") or "")
         model = await backend.resolve_model(model_name)
-        opts = header_options(request, TurnOptions(model=model))
+        opts = header_options(
+            request,
+            TurnOptions(
+                model=model,
+                stop_sequences=stop_list(body.get("stop")),
+                max_tokens=int_or_none(body.get("max_tokens")),
+            ),
+        )
         completion_id = new_id("cmpl-")
         created = now()
         echo = bool(body.get("echo"))
@@ -62,7 +72,8 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
             return sse_response(
                 stream_completion(
                     backend, conversation, opts, completion_id, created, display_model, echo, prompt
-                )
+                ),
+                keepalive=backend.settings.sse_keepalive,
             )
 
         text = ""
@@ -75,12 +86,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                     done = event
         assert done is not None
         if done.finish == "error":
-            raise GatewayError(
-                done.error or "Kiro turn failed",
-                status=502,
-                error_type="api_error",
-                code="kiro_error",
-            )
+            raise GatewayError.from_kiro(done.error or "Kiro turn failed")
         return JSONResponse(
             {
                 "id": completion_id,
@@ -133,15 +139,7 @@ async def stream_completion(
                     yield chunk(event.text)
                 elif isinstance(event, OutputDone):
                     if event.finish == "error":
-                        yield sse(
-                            {
-                                "error": {
-                                    "message": event.error or "Kiro turn failed",
-                                    "type": "api_error",
-                                    "code": "kiro_error",
-                                }
-                            }
-                        )
+                        yield sse(stream_error_body(event.error or "Kiro turn failed"))
                     else:
                         yield chunk("", finish_reason(event.finish))
     except GatewayError as error:

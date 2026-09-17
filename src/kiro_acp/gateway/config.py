@@ -41,6 +41,10 @@ class Settings(BaseSettings):
         description="Extra alias -> Kiro model mappings; keys may be shell globs (e.g. 'gpt-4*': 'gpt-5.6-terra')",
     )
     models_cache_ttl: float = Field(default=600.0, description="Seconds to cache the model list")
+    model_alias_style: Literal["both", "native"] = Field(
+        default="both",
+        description="'both' also lists hyphenated ids (claude-sonnet-4-6) and claude-auto/auto for Claude Code; 'native' lists Kiro ids only",
+    )
 
     # --- permissions ---------------------------------------------------------
     permissions: PermissionMode = Field(
@@ -84,6 +88,19 @@ class Settings(BaseSettings):
     log_level: str = "info"
     debug_acp: bool = Field(default=False, description="Log raw ACP traffic")
 
+    # --- streaming -----------------------------------------------------------
+    sse_keepalive: float = Field(
+        default=15.0,
+        description="Seconds of silence before an SSE keepalive (Anthropic ping / OpenAI comment) is sent; 0 disables",
+    )
+    warmup: bool = Field(
+        default=True, description="Load the model catalogue in the background at startup"
+    )
+    enforce_max_tokens: bool = Field(
+        default=False,
+        description="Cut off output at the request's max_tokens using the token estimator (Kiro itself ignores it)",
+    )
+
     # --- execution -----------------------------------------------------------
     max_concurrency: int = Field(default=4, ge=1, description="Max simultaneous Kiro turns")
     timeout: float = Field(default=900.0, description="Max seconds for one turn")
@@ -113,6 +130,10 @@ class Settings(BaseSettings):
     )
     expose_thoughts: bool = Field(
         default=True, description="Forward agent thought chunks as reasoning/thinking"
+    )
+    sanitize_system: bool = Field(
+        default=False,
+        description="Strip identity/concealment lines from client system prompts before rendering (defensive; off by default)",
     )
     usage_estimates: bool = Field(
         default=True, description="Report estimated token usage (Kiro reports credits, not tokens)"

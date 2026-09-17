@@ -42,8 +42,52 @@ def sse(data: Any, event: str | None = None) -> str:
     return f"data: {payload}\n\n"
 
 
-def sse_response(generator: AsyncIterator[str]) -> StreamingResponse:
+def sse_response(
+    generator: AsyncIterator[str], *, keepalive: float = 0.0, ping: str = ": keepalive\n\n"
+) -> StreamingResponse:
+    if keepalive and keepalive > 0:
+        generator = with_keepalive(generator, keepalive, ping)
     return StreamingResponse(generator, media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+async def with_keepalive(
+    source: AsyncIterator[str], interval: float, ping: str
+) -> AsyncIterator[str]:
+    """Yield from ``source``, inserting ``ping`` whenever it is silent for ``interval`` seconds.
+
+    Kiro emits nothing while one of its tools runs, and some clients (Claude Code) abort a
+    stream that is silent for too long.
+    """
+    import asyncio
+    from contextlib import aclosing
+
+    async with aclosing(source) as events:
+        iterator = events.__aiter__()
+        pending: asyncio.Task[str] | None = None
+        try:
+            while True:
+                if pending is None:
+                    pending = asyncio.ensure_future(iterator.__anext__())
+                done, _ = await asyncio.wait({pending}, timeout=interval)
+                if not done:
+                    yield ping
+                    continue
+                task, pending = pending, None
+                try:
+                    item = task.result()
+                except StopAsyncIteration:
+                    return
+                yield item
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+
+
+def stream_error_body(message: str) -> JSON:
+    from kiro_acp.gateway.backend import classify_kiro_error
+
+    _status, error_type, code, _retry = classify_kiro_error(message)
+    return {"error": {"message": message, "type": error_type, "code": code}}
 
 
 def image_from_data_url(url: str, *, default_mime: str = "image/png") -> ImagePart:
@@ -74,6 +118,23 @@ def header_options(request: Request, opts: TurnOptions) -> TurnOptions:
         opts.permissions = permissions.strip().lower()
     opts.request_id = request.headers.get("x-request-id") or new_id("req_")
     return opts
+
+
+def stop_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, list):
+        return [str(v) for v in value if isinstance(v, str) and v]
+    return []
+
+
+def int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def json_dumps(value: Any) -> str:

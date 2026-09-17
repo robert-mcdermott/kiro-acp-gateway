@@ -18,6 +18,7 @@ import asyncio
 import fnmatch
 import logging
 import os
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -40,20 +41,63 @@ PermissionCallback = Callable[[PermissionRequest], Awaitable[JSON]]
 POLICY_NAMES = ("deny", "allow-once", "allow-always", "allow-all", "ask")
 
 
+# Claude Code style tool patterns: Bash(git status*), Read(/etc/*), mcp__server__tool.
+_TOOL_PATTERN_RE = re.compile(r"^(?P<name>[A-Za-z_][\w-]*)(?:\((?P<arg>.*)\))?$")
+_CLAUDE_TOOL_KINDS: dict[str, tuple[str, ...]] = {
+    "bash": ("execute",),
+    "shell": ("execute",),
+    "read": ("read",),
+    "write": ("edit",),
+    "edit": ("edit",),
+    "multiedit": ("edit",),
+    "notebookedit": ("edit",),
+    "glob": ("search",),
+    "grep": ("search",),
+    "webfetch": ("fetch",),
+    "websearch": ("fetch",),
+}
+
+
+def _request_subject(request: PermissionRequest) -> str:
+    """The command or path a permission request is about, for Claude Code style patterns."""
+    raw = request.raw_input if isinstance(request.raw_input, dict) else {}
+    for key in ("command", "cmd"):
+        if isinstance(raw.get(key), str):
+            return raw[key]
+    for key in ("path", "file_path", "filePath"):
+        if isinstance(raw.get(key), str):
+            return raw[key]
+    locations = raw.get("locations") if isinstance(raw.get("locations"), list) else None
+    if locations and isinstance(locations[0], dict) and locations[0].get("path"):
+        return str(locations[0]["path"])
+    title = request.title
+    for prefix in ("Running: ", "Reading ", "Writing ", "Creating ", "Editing ", "Run Command: "):
+        if title.startswith(prefix):
+            return title[len(prefix) :]
+    return title
+
+
 @dataclass(slots=True)
 class PermissionRule:
     """Match a permission request and force a decision.
 
-    ``kinds`` matches the ACP tool kind (``read``, ``edit``, ``execute`` ...),
-    ``tools`` matches Kiro's tool name (``shell``, ``write`` ...) using shell
-    globs, and ``titles`` matches the human title. Any empty selector matches
-    everything. ``decision`` is ``"allow"`` or ``"deny"``.
+    Two syntaxes are accepted by :meth:`parse`:
+
+    * selectors — ``"allow:kind=read,search;tool=shell;title=Running: ls*"``. ``kinds``
+      matches the ACP tool kind, ``tools`` Kiro's tool name (shell globs), ``titles`` the
+      human title (shell globs). Empty selectors match everything.
+    * Claude Code tool patterns — ``"allow:Bash(git status*)"``, ``"deny:Read(/etc/*)"``,
+      ``"allow:Edit"``, ``"allow:mcp__server__tool"``. The tool name maps to ACP kinds
+      (``Bash``→execute, ``Read``→read, ``Write``/``Edit``→edit, ``Glob``/``Grep``→search,
+      ``WebFetch``→fetch); the parenthesised glob matches the command or path.
     """
 
     decision: str
     kinds: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
     titles: tuple[str, ...] = ()
+    subject: str | None = None
+    mcp_tool: str | None = None
 
     def matches(self, request: PermissionRequest) -> bool:
         if self.kinds and request.kind.value not in self.kinds:
@@ -62,21 +106,43 @@ class PermissionRule:
             fnmatch.fnmatch(request.tool_name or "", pattern) for pattern in self.tools
         ):
             return False
-        return not self.titles or any(
+        if self.titles and not any(
             fnmatch.fnmatch(request.title, pattern) for pattern in self.titles
-        )
+        ):
+            return False
+        if self.mcp_tool is not None:
+            raw_name = request.tool_name or ""
+            name = raw_name.replace("/", "__").replace("@", "")
+            if not name.startswith("mcp__"):
+                name = "mcp__" + name
+            if not (
+                fnmatch.fnmatch(name, self.mcp_tool)
+                or fnmatch.fnmatch(raw_name, self.mcp_tool)
+                or fnmatch.fnmatch(request.title, self.mcp_tool)
+            ):
+                return False
+        if self.subject is not None:
+            subject = _request_subject(request)
+            if not (
+                fnmatch.fnmatch(subject, self.subject)
+                or fnmatch.fnmatch(subject.strip(), self.subject)
+            ):
+                return False
+        return True
 
     @classmethod
     def parse(cls, text: str) -> PermissionRule:
-        """Parse ``"allow:kind=read,search;tool=shell"`` style rule strings."""
-        decision, _, selectors = text.strip().partition(":")
+        decision, _, rest = text.strip().partition(":")
         decision = decision.strip().lower()
         if decision not in ("allow", "deny"):
             raise ValueError(f"Rule must start with allow: or deny: ({text!r})")
+        rest = rest.strip()
+        if "=" not in rest and rest:
+            return cls._parse_tool_pattern(decision, rest, text)
         kinds: list[str] = []
         tools: list[str] = []
         titles: list[str] = []
-        for selector in filter(None, (s.strip() for s in selectors.split(";"))):
+        for selector in filter(None, (s.strip() for s in rest.split(";"))):
             key, _, values = selector.partition("=")
             items = [v.strip() for v in values.split(",") if v.strip()]
             match key.strip().lower():
@@ -89,6 +155,22 @@ class PermissionRule:
                 case _:
                     raise ValueError(f"Unknown rule selector {key!r} in {text!r}")
         return cls(decision=decision, kinds=tuple(kinds), tools=tuple(tools), titles=tuple(titles))
+
+    @classmethod
+    def _parse_tool_pattern(cls, decision: str, rest: str, text: str) -> PermissionRule:
+        match = _TOOL_PATTERN_RE.match(rest)
+        if not match:
+            raise ValueError(f"Unrecognized permission rule {text!r}")
+        name = match.group("name")
+        arg = match.group("arg")
+        if name.startswith("mcp__"):
+            return cls(decision=decision, mcp_tool=name)
+        kinds = _CLAUDE_TOOL_KINDS.get(name.lower())
+        if kinds is None:
+            raise ValueError(
+                f"Unknown tool {name!r} in {text!r}; expected Bash, Read, Write, Edit, Glob, Grep, WebFetch, or mcp__server__tool"
+            )
+        return cls(decision=decision, kinds=kinds, subject=arg if arg not in (None, "") else None)
 
 
 @dataclass

@@ -27,12 +27,15 @@ from kiro_acp.gateway.conversation import (
 from kiro_acp.gateway.protocols.common import (
     header_options,
     image_from_data_url,
+    int_or_none,
     json_dumps,
     new_id,
     now,
     read_json,
     sse,
     sse_response,
+    stop_list,
+    stream_error_body,
     text_of_content,
 )
 from kiro_acp.gateway.turn import OutputDone, OutputText, OutputThought, OutputToolCall
@@ -253,7 +256,14 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
         if backend.settings.tool_mode == "ignore":
             emulate = False
         opts = header_options(
-            request, TurnOptions(model=model, effort=conversation.effort, emulate_tools=emulate)
+            request,
+            TurnOptions(
+                model=model,
+                effort=conversation.effort,
+                emulate_tools=emulate,
+                stop_sequences=stop_list(body.get("stop")),
+                max_tokens=int_or_none(body.get("max_completion_tokens") or body.get("max_tokens")),
+            ),
         )
         completion_id = new_id("chatcmpl-")
         created = now()
@@ -271,7 +281,8 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                     model_name or model or "kiro",
                     include_usage,
                     expose_thoughts,
-                )
+                ),
+                keepalive=backend.settings.sse_keepalive,
             )
 
         text = ""
@@ -291,12 +302,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                         done = event
         assert done is not None
         if done.finish == "error":
-            raise GatewayError(
-                done.error or "Kiro turn failed",
-                status=502,
-                error_type="api_error",
-                code="kiro_error",
-            )
+            raise GatewayError.from_kiro(done.error or "Kiro turn failed")
         text, thoughts, calls = done.text, done.thoughts, done.tool_calls
         message: JSON = {
             "role": "assistant",
@@ -367,15 +373,7 @@ async def stream_chat(
                         call_index += 1
                     case OutputDone(finish=finish, error=error, usage=usage, kiro=kiro):
                         if finish == "error":
-                            yield sse(
-                                {
-                                    "error": {
-                                        "message": error or "Kiro turn failed",
-                                        "type": "api_error",
-                                        "code": "kiro_error",
-                                    }
-                                }
-                            )
+                            yield sse(stream_error_body(error or "Kiro turn failed"))
                         else:
                             final: JSON = {}
                             yield chunk(final, finish_reason(finish))

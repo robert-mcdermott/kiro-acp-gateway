@@ -115,7 +115,14 @@ uv run kiro-acp prompt --permissions deny \
 
 Rule selectors are `kind=` (ACP tool kind: `read`, `edit`, `delete`, `move`, `search`,
 `execute`, `fetch`, `think`, `other`), `tool=` (Kiro tool name, shell globs), and
-`title=` (the human title, shell globs).
+`title=` (the human title, shell globs). Claude Code's permission syntax works too and
+matches the command or path Kiro is asking about:
+
+```bash
+uv run kiro-acp prompt --permissions deny \
+  --allow "Read" --allow "Glob" --allow "Bash(git status*)" --allow "Bash(uv run pytest*)" \
+  --deny "Read(/etc/*)" "Run the tests and summarize failures"
+```
 
 `--fs` and `--terminal` let Kiro use the client's file-system and terminal capabilities
 (the v3 engine uses them when offered); by default Kiro uses its own built-in tools.
@@ -387,6 +394,17 @@ surfaced as reasoning (`reasoning_content`, Responses `reasoning` items, Anthrop
 `thinking` blocks) by default; `KIRO_GATEWAY_TOOL_ACTIVITY=text` puts it in the answer and
 `none` hides it. Full details are always in the `kiro.tool_calls` extension field.
 
+**Stop sequences and limits.** Kiro ignores `stop`/`stop_sequences` and `max_tokens`, so
+the gateway enforces them itself: text is watched as it streams, and when a stop sequence
+appears the reply is truncated, the Kiro turn cancelled, and `stop`/`stop_sequence`
+reported. `max_tokens` enforcement is opt-in (`KIRO_GATEWAY_ENFORCE_MAX_TOKENS`) because
+the count is an estimate. Long silent stretches (Kiro running a tool) are covered by
+periodic keepalives so clients with stream watchdogs do not disconnect.
+
+**Errors.** Kiro failures are classified so SDK retry logic works: throttling and quota
+errors become `429` with `Retry-After`, model unavailable or overloaded `503`, backend
+timeouts `504`, anything else `502`.
+
 **Effort.** `reasoning_effort`, `reasoning.effort`, and `output_config.effort` map to
 Kiro's `low|medium|high|max` (`xhigh` becomes `max`). The v3 engine only exposes effort for
 some models; when it cannot be applied the response carries `kiro.effort_warning`.
@@ -421,7 +439,7 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_MODEL_FALLBACK` | `true` | Fall back instead of returning 404. |
 | `KIRO_GATEWAY_MODEL_ALIASES` | empty | `pattern=model,...` extra aliases. |
 | `KIRO_GATEWAY_PERMISSIONS` | `deny` | Policy for Kiro's tool requests in agent mode. |
-| `KIRO_GATEWAY_PERMISSION_RULES` | empty | `allow:kind=read;deny:tool=shell` style rules, `;`-separated. |
+| `KIRO_GATEWAY_PERMISSION_RULES` | empty | Ordered rules: `allow:kind=read,search`, `deny:tool=shell`, or Claude Code style `allow:Bash(git status*)`, `deny:Read(/etc/*)`, `allow:mcp__server__tool`. |
 | `KIRO_GATEWAY_HARNESS_PERMISSIONS` | `deny` | Policy while emulating client tools. |
 | `KIRO_GATEWAY_HARNESS_ENGINE` | `v2` | Kiro engine for harness-mode turns (empty = same as `KIRO_GATEWAY_ENGINE`). |
 | `KIRO_GATEWAY_HARNESS_AGENT` | `kiro-gateway-harness` | Tool-less Kiro agent used in harness mode (empty disables). |
@@ -432,6 +450,11 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_DELETE_SESSIONS` | `true` | Delete Kiro's stored copy of gateway sessions when they are closed (v3). |
 | `KIRO_GATEWAY_MAX_CONCURRENCY` | `4` | Simultaneous turns. |
 | `KIRO_GATEWAY_TIMEOUT` | `900` | Seconds per turn before cancellation. |
+| `KIRO_GATEWAY_SSE_KEEPALIVE` | `15` | Seconds of stream silence before a keepalive (`ping` / SSE comment); `0` disables. |
+| `KIRO_GATEWAY_WARMUP` | `true` | Load the model catalogue in the background at startup. |
+| `KIRO_GATEWAY_ENFORCE_MAX_TOKENS` | `false` | Cut output at the request's `max_tokens` using the token estimator. `stop` sequences are always enforced. |
+| `KIRO_GATEWAY_MODEL_ALIAS_STYLE` | `both` | Also list hyphenated ids (`claude-sonnet-4-6`) and `claude-auto`/`auto`; `native` lists Kiro ids only. |
+| `KIRO_GATEWAY_SANITIZE_SYSTEM` | `false` | Strip identity and concealment lines from client system prompts (defensive second layer). |
 | `KIRO_GATEWAY_TOOL_MODE` | `emulate` | What to do with client tool definitions: `emulate` (harness mode), `ignore` (drop them and run agent mode), or `reject` (400). |
 | `KIRO_GATEWAY_TOOL_ACTIVITY` | `thought` | `thought`, `text`, or `none`. |
 | `KIRO_GATEWAY_EXPOSE_THOUGHTS` | `true` | Forward Kiro's thinking. |

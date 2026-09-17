@@ -2,11 +2,35 @@
 
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from kiro_acp.gateway.backend import GatewayError, KiroBackend
 from kiro_acp.gateway.protocols.common import now
+
+
+def hyphenated(model_id: str) -> str | None:
+    """``claude-sonnet-4.6`` -> ``claude-sonnet-4-6`` (None when nothing changes)."""
+    alias = re.sub(r"(?<=\d)\.(?=\d)", "-", model_id)
+    return alias if alias != model_id else None
+
+
+def catalogue(backend: KiroBackend, models) -> list[tuple[str, str | None, str | None]]:
+    """(id, display name, description) rows, including Claude Code friendly aliases."""
+    rows = [(m.model_id, m.name, m.description) for m in models]
+    if backend.settings.model_alias_style == "both":
+        seen = {m.model_id for m in models}
+        for m in models:
+            alias = hyphenated(m.model_id)
+            if alias and alias not in seen:
+                rows.append((alias, m.name, f"Alias of {m.model_id}"))
+                seen.add(alias)
+        for alias in ("claude-auto", "auto"):
+            if alias not in seen:
+                rows.append((alias, "Kiro default model", "Alias of the gateway default model"))
+    return rows
 
 
 def make_router(backend_dep, auth_dep, *, style: str = "auto") -> APIRouter:
@@ -23,15 +47,16 @@ def make_router(backend_dep, auth_dep, *, style: str = "auto") -> APIRouter:
     async def list_models(request: Request, backend: KiroBackend = Depends(backend_dep)):
         models = await backend.models()
         created = now()
+        rows = catalogue(backend, models)
         if anthropic_style(request):
             data = [
                 {
                     "type": "model",
-                    "id": m.model_id,
-                    "display_name": m.name or m.model_id,
+                    "id": model_id,
+                    "display_name": name or model_id,
                     "created_at": "2025-01-01T00:00:00Z",
                 }
-                for m in models
+                for model_id, name, _ in rows
             ]
             return JSONResponse(
                 {
@@ -46,13 +71,13 @@ def make_router(backend_dep, auth_dep, *, style: str = "auto") -> APIRouter:
                 "object": "list",
                 "data": [
                     {
-                        "id": m.model_id,
+                        "id": model_id,
                         "object": "model",
                         "created": created,
                         "owned_by": "kiro",
-                        "description": m.description,
+                        "description": description,
                     }
-                    for m in models
+                    for model_id, _, description in rows
                 ],
             }
         )

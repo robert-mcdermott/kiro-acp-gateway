@@ -1,11 +1,13 @@
 # Roadmap
 
+Status legend: items marked **DONE** are implemented and tested; the rest are open.
+
 Planned improvements, in priority order. Each item lists why it matters, what "done"
 looks like, and a rough size (S: under an hour, M: a few hours, L: a day or more).
 
 ## P1 — reliability for long-running harness sessions
 
-### 1. SSE keepalive during silent tool runs — S
+### 1. SSE keepalive during silent tool runs — DONE — S
 Kiro emits nothing while a tool executes, so a long shell command produces a long silent
 stream. Claude Code aborts a stream after 300 s of silence and some proxies time out
 sooner.
@@ -16,13 +18,13 @@ sooner.
 - Test: fake agent gains a `sleep:<seconds>` scenario; assert keepalives appear and the
   final JSON is unaffected.
 
-### 2. Model catalogue warm-up at startup — S
+### 2. Model catalogue warm-up at startup — DONE — S
 First request currently pays for model discovery (one Kiro process spawn, several
 seconds on v3). Run `KiroBackend.models()` in the lifespan after start, in the background
 so startup is not blocked, and log the count. Health endpoint already reports
 `models_cached`.
 
-### 3. Gateway-side `stop` sequences and `max_tokens` — M
+### 3. Gateway-side `stop` sequences and `max_tokens` — DONE — M
 Kiro ignores both. Add a `StreamLimiter` between the backend and the adapters:
 - `stop`/`stop_sequences`: hold back `len(longest_stop) - 1` characters so matches spanning
   chunks are caught; on match, truncate, cancel the turn, and report `finish_reason =
@@ -32,7 +34,7 @@ Kiro ignores both. Add a `StreamLimiter` between the backend and the adapters:
   estimate is approximate); on hit, cancel and report `length` / `max_tokens`.
 - Never apply stop sequences inside an emulated `<tool_call>` block.
 
-### 4. Error classification with `Retry-After`  — S
+### 4. Error classification with `Retry-After` — DONE  — S
 Map Kiro error text to HTTP status so SDK retry logic works: throttling/quota → 429 with
 `Retry-After`, model unavailable/overloaded → 503, backend timeout → 504, everything else
 502. Keep the raw Kiro message in the error body. Streaming: same classification inside
@@ -40,7 +42,7 @@ the in-stream error event (`error.type` / `code`).
 
 ## P2 — compatibility polish
 
-### 5. Model-id presentation for Claude Code — S
+### 5. Model-id presentation for Claude Code — DONE — S
 Claude Code 2.x flags dotted ids (`claude-sonnet-4.6`) as unrecognized and its model
 picker filters on `^(claude|anthropic)`.
 - `/v1/models` (both formats) lists each Kiro model once under its native id and adds a
@@ -49,14 +51,14 @@ picker filters on `^(claude|anthropic)`.
 - Add `claude-auto` / `auto` entries that resolve to the gateway default model.
 - Setting `KIRO_GATEWAY_MODEL_ALIAS_STYLE=both|native` to turn the extra entries off.
 
-### 6. Claude Code permission syntax for Kiro's own tools — M
+### 6. Claude Code permission syntax for Kiro's own tools — DONE — M
 Accept `Bash(git status*)`, `Read(/etc/*)`, `Write(src/**)`, `mcp__server__tool` in
 `KIRO_GATEWAY_PERMISSION_RULES` and `kiro-acp --allow/--deny`, alongside the existing
 `kind=/tool=/title=` selectors. Match against the ACP tool kind, Kiro's tool name, the
 command or path in `rawInput`, and `_meta.trustOptions[].display`. Document precedence:
 explicit deny → explicit allow → policy default.
 
-### 7. System-prompt sanitizer as an optional second layer — S
+### 7. System-prompt sanitizer as an optional second layer — DONE — S
 Our harness framing keeps Kiro's identity, which resolved the Sonnet 5 refusals, but a
 defensive option costs little: `KIRO_GATEWAY_SANITIZE_SYSTEM=true` strips identity
 assertions and concealment instructions ("You are Claude Code", "never reveal you are…",
@@ -64,7 +66,7 @@ assertions and concealment instructions ("You are Claude Code", "never reveal yo
 Default off; log the number of lines removed. Regression test with a captured Claude
 Code system prompt.
 
-### 8. `/v1/embeddings` and unsupported endpoints — S
+### 8. `/v1/embeddings` and unsupported endpoints — DONE — S
 Return a clean 501 with an explanatory message for `/v1/embeddings`, `/v1/audio/*`,
 `/v1/images/*`, `/v1/files`, `/v1/batches` so SDK users get a clear error instead of 404.
 
