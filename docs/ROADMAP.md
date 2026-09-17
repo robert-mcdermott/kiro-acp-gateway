@@ -134,6 +134,70 @@ secret. Publish wheels with `uv build`; `uv tool install kiro-acp-gateway` from 
 Add a `Dockerfile` that installs kiro-cli and runs the gateway bound to `0.0.0.0` with a
 mounted workspace, as the recommended isolation story.
 
+## P5 — Additional things to concider if they improve the gateway
+
+### 19. Richer rendering of Kiro's own tool activity *(pattern)* — S
+Our `tool_activity` lines are just `[kiro:kind] title`. Theirs render arguments as
+`key=value` lines, edits as fenced ```diff blocks from `content[].diff`, `execute` output
+in fenced blocks, and `search` results as a one-line summary, and they fold Kiro's
+todo/plan tool into a `- [ ]` checklist in the reasoning channel. Do the same in
+`describe_activity` for both `thought` and `text` modes, with a size cap per event.
+
+### 20. Context window and limits in `/v1/models` *(pattern, Collomia-relevant)* — S
+Collomia reads `context_length` / `max_context_length` from `/v1/models`; OpenAI SDK
+clients ignore extra fields. Kiro's model descriptions state the window ("1M context
+window"); parse that into `context_length` (default 200k when absent) and add
+`max_completion_tokens`. Include the same in the Anthropic listing as `max_input_tokens`
+/ `max_tokens`, which newer Anthropic SDKs expose.
+
+### 21. Tool-execution audit ledger with redaction *(pattern)* — M
+Per-session bounded record of permission decisions, tool calls, updates, and cancel
+races, with secrets masked (bearer tokens, `sk-`/`gh*_`/`AKIA` keys, URL credentials).
+Expose as `GET /v1/kiro/sessions/{id}/audit` behind the API key and reference it from
+the `kiro` response field. Complements #14 (metrics).
+
+### 22. MCP servers per request and harness MCP discovery *(extends #10)* — M
+Accept `X-Kiro-MCP-Servers` / body `mcp_servers` (validated against an allow-list) in
+addition to config-file discovery for Claude Code (`~/.claude.json` projects,
+`<ws>/.mcp.json`), OpenCode (`opencode.json[c]` `mcp` block), Cursor/VS Code
+(`.cursor/mcp.json`, `.vscode/mcp.json`), and Kilo. Agent mode only; harness mode keeps
+the tool-less agent. Normalize HTTP entries (`type: "http"`, `headers` as an array).
+
+### 23. Client example configurations *(pattern)* — S
+An `examples/clients/` directory with ready-to-use configs and a one-line verification
+command for Claude Code, Codex (`kiro-` prefix or `model_catalog_json`), OpenCode, Kilo
+Code, Cline/Continue, Hermes, and Collomia, plus the OpenAI and Anthropic SDKs. Each
+example notes the recommended model class and which mode (harness/agent) it exercises.
+
+### 24. Codex model catalogue generator — S
+`kiro-acp codex-catalog > ~/.codex/kiro-models.json` emitting a `model_catalog_json`
+file for every Kiro model with `tool_mode: "direct"` and `use_responses_lite: false`, so
+Codex can use native names without the `kiro-` prefix and without the fallback-metadata
+warning. Document the `model_catalog_json = ...` config line.
+
+### 25. Document and PDF inputs *(pattern)* — S
+Anthropic `document` blocks with base64 PDF sources and OpenAI `file` parts: extract text
+locally (`pypdf`, optional dependency) and attach it as a text block; keep the current
+clear error when extraction is unavailable.
+
+### 26. Service installation scripts *(pattern)* — S
+`scripts/install-service.sh` generating a launchd plist (macOS) or systemd unit (Linux)
+that runs `uv run kiro-gateway` with an env file, plus `kiro-gateway --print-service`
+to emit the unit for review. Pairs with the Dockerfile in #18.
+
+### 27. Per-model notes in the model listing — S
+Record observed capabilities in `/v1/models` descriptions and in
+`docs/KIRO_ACP_NOTES.md`: which models emit thought chunks (their finding: opus yes,
+sonnet no on v2), which accept `/effort`, and which follow the emulated tool protocol
+reliably (Sonnet/Opus yes; GPT 5.6 previews mostly; Haiku no at harness prompt sizes).
+
+### Already covered here (confirmed by the review)
+Embedded `role: "system"` messages inside Anthropic `messages` (Claude Code 2.1.215+) are
+lifted into the system prompt; `GET /v1/models/{id}` is permissive for clients that probe
+it; `previous_response_id` and `store` are implemented rather than rejected; the SSE
+keepalive on `/v1/responses` is a comment line, never an invented event type; sessions are
+deleted rather than abandoned; per-request effort works on v2 via `/effort`.
+
 ## Deliberately not planned
 
 - Inferring the workspace from message text or unvalidated headers (a jail, not an anchor).
