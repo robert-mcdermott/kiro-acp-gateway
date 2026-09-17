@@ -1297,6 +1297,79 @@ async def test_chat_custom_tool(client: httpx.AsyncClient) -> None:
     assert follow.json()["kiro"]["reused_session"] is True
 
 
+async def test_refusal_is_surfaced(client: httpx.AsyncClient) -> None:
+    """Kiro's CONTENT_FILTERED metadata becomes a refusal finish reason, never a retry."""
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "x", "messages": [{"role": "user", "content": "refuse"}]},
+    )
+    body = response.json()
+    assert response.status_code == 200, response.text
+    assert body["choices"][0]["finish_reason"] == "content_filter"
+    assert body["kiro"]["refusal"]["category"] == "content_filter"
+    assert body["kiro"]["recommended_model"] == "claude-opus-4.8"
+    anthropic = await client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={"model": "x", "max_tokens": 50, "messages": [{"role": "user", "content": "refuse"}]},
+    )
+    assert anthropic.json()["stop_reason"] == "refusal"
+
+
+async def test_image_too_large_is_rejected(client: httpx.AsyncClient) -> None:
+    client.app.state.backend.settings.max_image_bytes = 1024  # type: ignore[attr-defined]
+    try:
+        data = "A" * 4000  # ~3000 decoded bytes
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "x",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "echo: hi"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64," + data},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+    finally:
+        client.app.state.backend.settings.max_image_bytes = 0  # type: ignore[attr-defined]
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "image_too_large"
+
+
+@pytest.mark.parametrize(
+    ("message", "status", "code"),
+    [
+        ("A prompt is already in progress for this session", 409, "session_busy"),
+        ("Invalid model ID: gpt-9", 400, "invalid_model"),
+        ("This model is not enabled for your account", 403, "model_not_entitled"),
+        ("Your monthly usage limit has been reached", 429, "usage_limit"),
+        ("ThrottlingException: rate exceeded", 429, "rate_limited"),
+        ("The model 'claude-opus-4.8' is not available right now", 503, "model_unavailable"),
+        ("The model you've selected is temporarily unavailable.", 503, "model_unavailable"),
+        ("Improperly formed request", 400, "malformed_request"),
+        ("Kiro failed to generate a response", 503, "kiro_unavailable"),
+        ("request timed out after 30s", 504, "kiro_timeout"),
+        ("Not signed in. Run kiro-cli login", 502, "kiro_auth"),
+        ("HTTP status 403 from backend", 502, "kiro_auth"),
+        ("ECONNRESET while streaming", 502, "kiro_connection"),
+        ("something unexpected", 502, "kiro_error"),
+    ],
+)
+def test_classify_kiro_error(message: str, status: int, code: str) -> None:
+    from kiro_acp.gateway.backend import classify_kiro_error
+
+    got_status, _, got_code, _ = classify_kiro_error(message)
+    assert (got_status, got_code) == (status, code)
+
+
 async def test_responses_streaming(client: httpx.AsyncClient) -> None:
     response = await client.post(
         "/v1/responses", json={"model": "x", "input": "thought", "stream": True}

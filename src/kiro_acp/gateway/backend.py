@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -83,37 +84,107 @@ class GatewayError(Exception):
         )
 
 
-_ERROR_RULES: list[tuple[tuple[str, ...], int, str, str, int | None]] = [
+# Ordered: the first matching pattern wins, so specific classes precede generic ones.
+# (pattern, HTTP status, API error type, code, Retry-After seconds)
+_ERROR_RULES: list[tuple[re.Pattern[str], int, str, str, int | None]] = [
+    (re.compile(r"already in progress"), 409, "invalid_request_error", "session_busy", 2),
+    (re.compile(r"invalid model id"), 400, "invalid_request_error", "invalid_model", None),
     (
-        ("throttl", "rate limit", "too many requests", "quota", "429", "slow down"),
+        re.compile(
+            r"not entitled|unentitled|not enabled for (?:your|this)|not available (?:to|for) your"
+            r"|subscription does not include|not included in your"
+        ),
+        403,
+        "permission_error",
+        "model_not_entitled",
+        None,
+    ),
+    (
+        re.compile(
+            r"(?:monthly|daily|weekly) (?:usage )?limit|usage limit|monthlylimiterror"
+            r"|freetierlimitexceeded|limit has been reached"
+        ),
+        429,
+        "rate_limit_error",
+        "usage_limit",
+        3600,
+    ),
+    (
+        re.compile(
+            r"throttl|rate.?limit|too many requests|quota|\b429\b|slow down"
+            r"|toomanyrequestsexception|servicequotaexceededexception"
+        ),
         429,
         "rate_limit_error",
         "rate_limited",
         30,
     ),
     (
-        ("overloaded", "capacity", "unavailable", "not available", "503", "temporarily"),
+        re.compile(
+            r"the model .{0,80}is not available|temporarily unavailable|model (?:is )?unavailable"
+            r"|model is not available"
+        ),
+        503,
+        "overloaded_error",
+        "model_unavailable",
+        30,
+    ),
+    (
+        re.compile(r"improperly formed request|malformed request|validationexception"),
+        400,
+        "invalid_request_error",
+        "malformed_request",
+        None,
+    ),
+    (
+        re.compile(
+            r"overloaded|capacity|unavailable|not available|\b503\b|\b529\b|temporarily"
+            r"|internal server error|internal failure|dispatch failure"
+            r"|failed to generate a response|try again"
+        ),
         503,
         "overloaded_error",
         "kiro_unavailable",
         10,
     ),
-    (("timed out", "timeout", "deadline"), 504, "api_error", "kiro_timeout", None),
+    (re.compile(r"timed out|timeout|deadline"), 504, "api_error", "kiro_timeout", None),
     (
-        ("unauthorized", "not logged in", "expired token", "authentication"),
+        re.compile(
+            r"unauthorized|not logged in|not signed in|not authenticated|expired ?token"
+            r"|authentication|accessdenied|invalid bearer|session (?:has )?expired"
+            r"|login (?:has )?expired|(?:http|status)\s*(?:code\s*)?40[13]\b"
+            r"|unrecognizedclientexception|invalidsignatureexception"
+        ),
         502,
         "api_error",
         "kiro_auth",
         None,
     ),
+    (
+        re.compile(
+            r"econnrefused|econnreset|econnaborted|ehostunreach|socket hang ?up|fetch failed"
+            r"|connection reset|connection refused|broken pipe"
+        ),
+        502,
+        "api_error",
+        "kiro_connection",
+        5,
+    ),
 ]
 
 
 def classify_kiro_error(message: str) -> tuple[int, str, str, int | None]:
-    """Map Kiro error text to (status, error_type, code, retry_after)."""
+    """Map Kiro error text to (status, error_type, code, retry_after).
+
+    Classes, most specific first: ``session_busy`` (a prompt is already running on the
+    session), ``invalid_model``, ``model_not_entitled``, ``usage_limit`` (plan quota),
+    ``rate_limited``, ``model_unavailable`` (capacity for one model), ``malformed_request``,
+    ``kiro_unavailable``, ``kiro_timeout``, ``kiro_auth``, ``kiro_connection``; anything
+    else is ``kiro_error``.
+    """
     lowered = message.lower()
-    for needles, status, error_type, code, retry_after in _ERROR_RULES:
-        if any(needle in lowered for needle in needles):
+    for pattern, status, error_type, code, retry_after in _ERROR_RULES:
+        if pattern.search(lowered):
             return status, error_type, code, retry_after
     return 502, "api_error", "kiro_error", None
 
@@ -272,6 +343,15 @@ class KiroBackend:
                 info = await agent.discover(delete=self.settings.delete_sessions)
             finally:
                 await agent.close()
+            if not info.available_models and self._models:
+                # A session racing a token refresh can answer with an empty or default
+                # catalogue; that is "no evidence", not a new truth. Keep the snapshot.
+                LOG.warning(
+                    "Kiro advertised no models this time; keeping the previous catalogue of %d",
+                    len(self._models),
+                )
+                self._models_at = time.monotonic()
+                return self._models
             self._models = list(info.available_models)
             self._default_model = info.current_model_id
             self._models_at = time.monotonic() if self._models else 0.0
@@ -523,6 +603,7 @@ class KiroBackend:
         """Execute one turn, yielding output events. Cancels Kiro if the consumer stops early."""
         if conversation.total_chars() > self.settings.max_prompt_chars:
             raise GatewayError("Prompt too large", status=413, code="prompt_too_large")
+        check_image_sizes(conversation, self.settings.max_image_bytes)
         if opts.effort:
             try:
                 opts.effort = normalize_effort(opts.effort)
@@ -606,6 +687,7 @@ class KiroBackend:
                 include_system=fresh,
                 emulate_tools=opts.emulate_tools,
                 sanitize=self.settings.sanitize_system,
+                image_capable=image_capable(pooled.agent),
             )
             parser = ToolCallParser(enabled=opts.emulate_tools)
             limiter = StreamLimiter(
@@ -707,6 +789,8 @@ class KiroBackend:
                                     calls.append(part)
                                     yield OutputToolCall(part)
                                 finish, error = map_stop(stop, turn_error, bool(calls))
+                                if detect_refusal(kiro_meta) and finish in ("stop", "tool_calls"):
+                                    finish = "refusal"
                                 if limiter.hit == "stop":
                                     finish, error = "stop", None
                                 elif limiter.hit == "length":
@@ -844,6 +928,7 @@ class KiroBackend:
                 include_system=fresh,
                 emulate_tools=False,
                 sanitize=self.settings.sanitize_system,
+                image_capable=image_capable(pooled.agent),
             )
             pending = PendingTurn(session=session, bridge=pooled.bridge)
             pending.start(blocks, timeout=0)
@@ -907,6 +992,8 @@ class KiroBackend:
                         merge_metadata(kiro_meta, data)
                     case TurnComplete(stop_reason=stop, error=turn_error):
                         finish, error = map_stop(stop, turn_error, False)
+                        if detect_refusal(kiro_meta) and finish == "stop":
+                            finish = "refusal"
                         completed = True
                         break
                     case _:
@@ -1050,6 +1137,51 @@ def map_stop(stop: StopReason, error: str | None, has_calls: bool) -> tuple[str,
     if stop in (StopReason.MAX_TOKENS, StopReason.MAX_TURN_REQUESTS):
         return "length", None
     return ("tool_calls" if has_calls else "stop"), None
+
+
+def image_capable(agent: KiroAgent) -> bool:
+    """Whether the agent advertised image prompt input during ``initialize``."""
+    result = agent.client.initialize_result
+    if result is None:
+        return True
+    return bool(result.agent_capabilities.prompt_capabilities.image)
+
+
+def check_image_sizes(conversation: Conversation, max_bytes: int) -> None:
+    if max_bytes <= 0:
+        return
+    for message in conversation.messages:
+        for image in message.images:
+            decoded = len(image.data_base64) * 3 // 4
+            if decoded > max_bytes:
+                raise GatewayError(
+                    f"Image input of about {decoded // 1024} KB exceeds the limit of "
+                    f"{max_bytes // 1024} KB (KIRO_GATEWAY_MAX_IMAGE_BYTES)",
+                    status=400,
+                    error_type="invalid_request_error",
+                    code="image_too_large",
+                )
+
+
+def detect_refusal(kiro_meta: JSON) -> bool:
+    """Kiro flags a model/content-filter refusal in ``_kiro.dev/metadata``.
+
+    ``stopReason: "CONTENT_FILTERED"`` and/or ``refusal: {category, explanation,
+    recommendedModel}``. The refusal object is normalised into ``kiro_meta["refusal"]``
+    (and ``recommended_model``) so clients can act on it; the finish reason becomes
+    ``refusal`` (OpenAI ``content_filter`` / Anthropic ``refusal``) and is never retried.
+    """
+    refusal = kiro_meta.get("refusal")
+    filtered = str(kiro_meta.get("stopReason") or "").upper() == "CONTENT_FILTERED"
+    if not filtered and not isinstance(refusal, dict):
+        return False
+    if not isinstance(refusal, dict):
+        refusal = {"category": "content_filtered"}
+    kiro_meta["refusal"] = refusal
+    recommended = refusal.get("recommendedModel") or refusal.get("recommended_model")
+    if recommended:
+        kiro_meta["recommended_model"] = recommended
+    return True
 
 
 def merge_metadata(target: JSON, data: JSON) -> None:

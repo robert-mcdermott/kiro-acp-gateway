@@ -30,6 +30,10 @@ def _scalar(value: object) -> str:
 def render_started(call: ToolCall, *, detail: str) -> str:
     lines = [f"⚙ {call.title or call.tool_name or call.kind.value}"]
     if detail == "full" and isinstance(call.raw_input, dict):
+        # Kiro passes the model's one-line reason for the call as __tool_use_purpose.
+        purpose = call.raw_input.get("__tool_use_purpose") or call.raw_input.get("purpose")
+        if isinstance(purpose, str) and purpose.strip():
+            lines.append(f"  purpose: {_scalar(purpose.strip())}")
         for key, value in call.raw_input.items():
             if key in HIDDEN_ARGS or value in (None, "", [], {}):
                 continue

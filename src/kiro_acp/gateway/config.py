@@ -173,6 +173,11 @@ class Settings(BaseSettings):
     max_prompt_chars: int = Field(
         default=2_000_000, description="Reject prompts larger than this many characters"
     )
+    max_image_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        ge=0,
+        description="Reject image inputs larger than this many decoded bytes (an oversized image can wedge a Kiro session); 0 disables",
+    )
     validate_json_output: bool = Field(
         default=True,
         description="Validate structured-output replies against the requested JSON schema and retry once (non-streaming)",

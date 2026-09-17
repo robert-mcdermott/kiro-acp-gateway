@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -132,6 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_codex_catalog)
 
     p = sub.add_parser("doctor", help="check the kiro-cli installation and ACP handshake")
+    p.add_argument(
+        "--kill-orphans",
+        action="store_true",
+        help="terminate orphaned 'kiro-cli acp' processes (parent gone) found on this machine",
+    )
     add_agent_options(p)
     p.set_defaults(func=cmd_doctor)
     return parser
@@ -446,9 +452,58 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         except ACPError as error:
             ok = False
             print(f"engine {engine}:           FAILED — {str(error).splitlines()[0]}")
+    orphans = find_orphaned_agents()
+    if orphans:
+        pids = ", ".join(str(pid) for pid, _ in orphans)
+        print(f"orphaned acp procs:  {len(orphans)} ({pids})")
+        if args.kill_orphans:
+            killed = kill_processes([pid for pid, _ in orphans])
+            print(f"  terminated {killed} process(es)")
+        else:
+            print("  re-run with --kill-orphans to terminate them")
+    else:
+        print("orphaned acp procs:  none")
     print("workspace:           " + args.cwd)
     print("result:              " + ("healthy" if ok else "problems found"))
     return EXIT_OK if ok else EXIT_ERROR
+
+
+def find_orphaned_agents() -> list[tuple[int, str]]:
+    """``kiro-cli acp`` processes whose parent is gone (re-parented to pid 1).
+
+    A gateway or CLI that is killed outright leaves its agents running; they hold a
+    session each and keep MCP servers alive. POSIX only.
+    """
+    if os.name != "posix":
+        return []
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found: list[tuple[int, str]] = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, command = parts
+        if "kiro-cli" in command and " acp" in command and ppid.strip() == "1":
+            found.append((int(pid), command.strip()))
+    return found
+
+
+def kill_processes(pids: list[int]) -> int:
+    import signal
+
+    killed = 0
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            continue
+    return killed
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -62,7 +62,7 @@ exit code tells you what happened.
 ### Quick start
 
 ```bash
-uv run kiro-acp doctor                          # verify kiro-cli and both engines
+uv run kiro-acp doctor                          # verify kiro-cli and both engines; lists orphaned acp processes (--kill-orphans)
 uv run kiro-acp models                          # models Kiro advertises
 uv run kiro-acp agents                          # Kiro agents (ACP modes)
 uv run kiro-acp prompt "Summarize this repository in three bullets."
@@ -525,6 +525,7 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_VALIDATE_JSON_OUTPUT` | `true` | Validate structured-output replies against the JSON schema and retry once (non-streaming). |
 | `KIRO_GATEWAY_EXPOSE_THOUGHTS` | `true` | Forward Kiro's thinking. |
 | `KIRO_GATEWAY_USAGE_ESTIMATES` | `true` | Estimated token counts. |
+| `KIRO_GATEWAY_MAX_IMAGE_BYTES` | `5242880` | Reject image inputs larger than this (decoded bytes) with `400 image_too_large`; an oversized image can wedge a Kiro session. `0` disables. Images are dropped with a note when the agent does not advertise image input. |
 | `KIRO_GATEWAY_SERVE_FS` / `SERVE_TERMINAL` | `false` | Offer client file-system / terminal capabilities to Kiro. |
 | `KIRO_GATEWAY_DEBUG_ACP` | `false` | Log raw ACP traffic. |
 | `KIRO_GATEWAY_LOG_LEVEL` | `info` | Log level. |
@@ -546,7 +547,26 @@ the working directory is also read). The most important ones:
 
 OpenAI routes return `{"error": {"message", "type", "param", "code"}}`; Anthropic routes
 return `{"type": "error", "error": {"type", "message"}}`. Failures after a stream has
-started are sent as an in-stream `error` event. Kiro failures are `502`.
+started are sent as an in-stream `error` event.
+
+Kiro failures are classified from their message so clients can decide whether to retry
+(`Retry-After` is set on the retryable ones):
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 400 | `invalid_model`, `malformed_request` | Kiro rejected the model id or the request shape. |
+| 403 | `model_not_entitled` | The account's plan does not include the model. |
+| 409 | `session_busy` | A prompt is already running on the Kiro session (retry shortly). |
+| 429 | `rate_limited`, `usage_limit` | Throttled, or the plan's usage limit is reached (`Retry-After` 30 s / 1 h). |
+| 502 | `kiro_auth`, `kiro_connection`, `kiro_error` | Not signed in or the token expired; connection dropped; anything unclassified. |
+| 503 | `model_unavailable`, `kiro_unavailable` | Capacity for that model, or Kiro/backend overloaded; also `kiro-cli` missing. |
+| 504 | `kiro_timeout` | The turn or a backend call timed out. |
+
+A model refusal or content filter is not an error: the reply completes with
+`finish_reason: "content_filter"` (OpenAI) / `stop_reason: "refusal"` (Anthropic) and the
+`kiro` block carries `refusal: {category, explanation, recommendedModel}` and, when Kiro
+suggests one, `recommended_model`. Every response's `kiro` block also reports
+`contextUsagePercentage` (how full the Kiro session's context is) and `credits`.
 
 ### Security
 
@@ -624,4 +644,4 @@ actually does on the wire, and [docs/ROADMAP.md](docs/ROADMAP.md) for planned wo
 
 ## License
 
-MIT
+Apache 2.0

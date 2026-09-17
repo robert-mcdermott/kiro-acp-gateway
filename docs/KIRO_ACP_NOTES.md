@@ -45,7 +45,7 @@ kiro-cli acp [--agent-engine v2|v3] [--model ID] [--effort L] [--agent NAME]
 |---|---|---|
 | Select model | `session/set_model {sessionId, modelId}` (accepts unknown ids, fails at prompt time) | `session/set_config_option {configId: "model", value}` (`session/set_model` errors) |
 | Select agent | `session/set_mode` | `session/set_mode` or config option `mode` |
-| Effort | prompt text `/effort <low\|medium\|high\|max>` → `Effort set to X`, or `Effort configuration is currently not available on <model>` | no ACP surface observed; `/effort` is treated as chat |
+| Effort | request `_kiro.dev/commands/execute` `{"sessionId", "command": {"command": "effort", "args": {"value": "high"}}}` → `{"success": true, "message": "Effort set to high"}` (2.22.0, confirmed); older CLIs: prompt text `/effort <level>` → `Effort set to X` | no ACP surface observed; `/effort` is treated as chat |
 | Other slash commands | `/model`, `/tools`, `/context` answer as text | treated as chat |
 
 `session/list` exists on v3 only. v3 persists every session it creates under
@@ -126,7 +126,7 @@ recorded for the roadmap (P6):
 
 | Method / field | Direction | Notes |
 |---|---|---|
-| `_kiro.dev/commands/execute` | client → agent | `{"sessionId", "command": {"command": "effort", "args": {...}}}`; string form gets no response; output in `result.text`. v2 only. |
+| `_kiro.dev/commands/execute` | client → agent | `{"sessionId", "command": {"command": "effort", "args": {"value": "high"}}}` → `{"success": true, "message": "..."}` on 2.22 (now used for effort); string form gets no response. v2 only. |
 | `session/new._meta.kiro.customAgents` | client → agent | v3: inline agent definitions (max 50), activated with `session/set_mode`. |
 | `_kiro.dev/session/terminate` | client → agent | v2: evict a session from a multiplexed process and reap its MCP children. |
 | `_session/steer` | client → agent | v2: `{"sessionId", "message": "<user_message>...</user_message>"}` mid-turn; `steering_consumed` update confirms. |

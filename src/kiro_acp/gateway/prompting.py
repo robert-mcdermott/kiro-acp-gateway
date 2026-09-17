@@ -99,11 +99,14 @@ def render_prompt(
     include_system: bool,
     emulate_tools: bool,
     sanitize: bool = False,
+    image_capable: bool = True,
 ) -> list[JSON]:
     """Build ``session/prompt`` blocks for messages ``conversation.messages[start:]``.
 
     ``include_system`` is true for a fresh session (the system text and, when
-    ``start > 0``, a transcript of the earlier messages are prepended).
+    ``start > 0``, a transcript of the earlier messages are prepended). When the agent
+    did not advertise image input (``image_capable``), images become a short note
+    instead of a block the agent would reject.
     """
     blocks: list[JSON] = []
     sections: list[str] = []
@@ -116,10 +119,18 @@ def render_prompt(
         # Fresh session but the client already has history: replay it as a transcript.
         start = 0
     rendered: list[str] = []
+    omitted = 0
     for message in messages[start:]:
         for image in message.images:
-            blocks.append(image_block(image.data_base64, image.mime_type))
+            if image_capable:
+                blocks.append(image_block(image.data_base64, image.mime_type))
+            else:
+                omitted += 1
         rendered.append(render_message(message))
+    if omitted:
+        rendered.append(
+            f"<note>{omitted} image(s) omitted: this agent does not accept image input.</note>"
+        )
     note = (TRANSCRIPT_NOTE + "\n") if (start == 0 and len(messages) > 1 and include_system) else ""
     sections.append("<conversation>\n" + note + "\n".join(rendered) + "\n</conversation>")
     if emulate_tools and conversation.tools and conversation.tool_choice.mode != "none":

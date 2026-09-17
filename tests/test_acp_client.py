@@ -71,6 +71,8 @@ async def test_effort(workspace: Path, engine: str) -> None:
         if engine == "v2":
             await session.set_effort("xhigh")
             assert session.effort == "max"
+            # Applied through _kiro.dev/commands/execute, not a prompt turn.
+            assert (await session.prompt_text("echo: ping")).text == "ping"
             with pytest.raises(ValueError, match="Unknown effort level"):
                 await session.set_effort("medium-rare")
         else:

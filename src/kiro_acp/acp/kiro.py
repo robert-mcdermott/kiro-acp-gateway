@@ -98,6 +98,8 @@ class KiroAgent:
         self.cwd = os.path.abspath(cwd or os.getcwd())
         env = dict(os.environ)
         env.update(self.options.env)
+        # Marker for orphan detection (``kiro-acp doctor``): the pid that spawned this agent.
+        env.setdefault("KIRO_ACP_PARENT_PID", str(os.getpid()))
         self.client = ACPClient(
             self.options.command(),
             cwd=self.cwd,

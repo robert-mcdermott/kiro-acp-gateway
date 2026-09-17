@@ -242,12 +242,47 @@ class Session:
             raise EffortNotSupported(
                 f"The v3 engine exposes no effort setting for model {self.model_id!r}"
             )
+        if await self._effort_command(level):
+            self.effort = level
+            return
         result = await self.prompt_text(f"/effort {level}", timeout=60)
         reply = result.text.strip()
         if result.ok and ("effort set to" in reply.lower() or reply.lower() == "ok"):
             self.effort = level
             return
         raise EffortNotSupported(reply or f"Agent did not accept effort level {level!r}")
+
+    async def _effort_command(self, level: str) -> bool:
+        """Set effort through Kiro v2's ``_kiro.dev/commands/execute`` request.
+
+        The object form (``{"command": "effort", "args": {"value": level}}``) answers
+        in the response itself, so no prompt turn is spent and no assistant text is
+        produced. Returns ``False`` when the agent lacks the method (older CLIs), so
+        the caller can fall back to the ``/effort`` prompt.
+        """
+        try:
+            result = await self.client.request(
+                "_kiro.dev/commands/execute",
+                {
+                    "sessionId": self.session_id,
+                    "command": {"command": "effort", "args": {"value": level}},
+                },
+                timeout=30,
+            )
+        except ACPRemoteError as error:
+            if error.is_method_not_found:
+                return False
+            raise EffortNotSupported(str(error)) from error
+        except ACPTimeoutError:
+            LOG.info("commands/execute did not answer; falling back to the /effort prompt")
+            return False
+        text = ""
+        if isinstance(result, dict):
+            text = str(result.get("text") or result.get("message") or "")
+        lowered = text.lower()
+        if "invalid" in lowered or "error" in lowered or "unknown" in lowered:
+            raise EffortNotSupported(text.strip())
+        return True
 
     # ------------------------------------------------------------------ prompting
 

@@ -11,6 +11,8 @@ Behaviour is driven by the *prompt text* so tests can request scenarios:
 * ``"terminal"``              – runs ``echo hi`` through the client's terminal methods.
 * ``"crash"``                 – exits the process mid-turn.
 * ``"/effort <level>"``       – replies ``Effort set to <level>`` (v2 style).
+* ``"refuse"``                – answers, then sends ``_kiro.dev/metadata`` with ``CONTENT_FILTERED``.
+* ``_kiro.dev/commands/execute`` (v2) – object-form ``effort`` command answered in the response.
 * anything else              – replies with a fixed sentence.
 
 Set ``FAKE_ACP_ENGINE=v3`` to advertise ``configOptions`` instead of Kiro's
@@ -38,6 +40,7 @@ class Agent:
         self.pending: dict[Any, asyncio.Future[Any]] = {}
         self.sessions: dict[str, JSON] = {}
         self.cancelled: set[str] = set()
+        self.commands: list[tuple[str, str]] = []
         self.session_counter = 0
 
     async def send(self, message: JSON) -> None:
@@ -148,6 +151,20 @@ class Agent:
                     {"sessionId": sid, "cwd": s["cwd"]} for sid, s in self.sessions.items()
                 ]
             }
+        if method == "_kiro.dev/commands/execute":
+            if ENGINE == "v3":
+                raise RpcError(-32601, "Method not found", method)
+            command = params.get("command")
+            if not isinstance(command, dict):
+                # kiro-cli 2.14 never answers the string form; emulate by refusing loudly.
+                raise RpcError(-32602, "Invalid params", "command must be an object")
+            if command.get("command") == "effort":
+                level = str((command.get("args") or {}).get("value", ""))
+                self.commands.append(("effort", level))
+                if level in ("low", "medium", "high", "max"):
+                    return {"text": f"Effort set to {level}"}
+                return {"text": f"invalid value '{level}' for 'output_config.effort'"}
+            return {"text": f"unknown command {command.get('command')!r}"}
         if method == "_kiro/session/delete":
             if ENGINE != "v3":
                 raise RpcError(-32601, "Method not found", method)
@@ -312,6 +329,22 @@ class Agent:
                 result = await client.call(name, json.loads(raw_args))
                 await say("result: " + result)
             await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 5})
+            return {"stopReason": "end_turn"}
+        if text == "refuse":
+            await say("I can't help with that request.")
+            await self.notify(
+                "_kiro.dev/metadata",
+                {
+                    "sessionId": session_id,
+                    "stopReason": "CONTENT_FILTERED",
+                    "refusal": {
+                        "category": "content_filter",
+                        "explanation": "The request was declined by the model.",
+                        "recommendedModel": "claude-opus-4.8",
+                    },
+                    "turnDurationMs": 3,
+                },
+            )
             return {"stopReason": "end_turn"}
         if text == "badjson":
             await say("not json at all")

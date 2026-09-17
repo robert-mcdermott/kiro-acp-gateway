@@ -3,9 +3,9 @@ name = "kiro-acp-gateway"
 version = "0.1.0"
 description = "Agent Client Protocol (ACP) client library, CLI utility, and OpenAI/Anthropic-compatible gateway for the Kiro CLI"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
+authors = [{ name = "Robert McDermott", email = "robert.c.mcdermott@gmail.com" }]
 requires-python = ">=3.11"
-authors = [{ name = "Robert McDermott" }]
 keywords = ["kiro", "acp", "agent-client-protocol", "openai", "anthropic", "gateway"]
 dependencies = [
     "fastapi>=0.115",

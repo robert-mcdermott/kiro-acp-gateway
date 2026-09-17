@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
@@ -101,6 +102,9 @@ class ACPClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=64 * 1024 * 1024,
+                # Own process group so kiro-cli's children (kiro-cli-chat, MCP servers)
+                # die with it instead of lingering as orphans.
+                start_new_session=os.name == "posix",
             )
         except FileNotFoundError as error:
             raise ACPProcessError(
@@ -110,6 +114,22 @@ class ACPClient:
             raise ACPProcessError(f"Failed to start agent {self.command!r}: {error}") from error
         self._reader_task = asyncio.create_task(self._read_stdout(), name="acp-stdout")
         self._stderr_task = asyncio.create_task(self._read_stderr(), name="acp-stderr")
+
+    def _signal_group(self, sig: int) -> None:
+        """Signal the agent's whole process group (falls back to the process itself)."""
+        process = self.process
+        if process is None or process.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            if os.name == "posix":
+                os.killpg(process.pid, sig)
+            elif sig == signal.SIGKILL:
+                process.kill()
+            else:
+                process.terminate()
+            return
+        with contextlib.suppress(ProcessLookupError):
+            process.send_signal(sig)
 
     async def initialize(self, *, timeout: float | None = None) -> InitializeResult:
         params: JSON = {
@@ -142,13 +162,11 @@ class ACPClient:
             try:
                 await asyncio.wait_for(process.wait(), grace)
             except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    process.terminate()
+                self._signal_group(signal.SIGTERM)
                 try:
                     await asyncio.wait_for(process.wait(), 2.0)
                 except TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
+                    self._signal_group(signal.SIGKILL)
                     await process.wait()
         for task in list(self._inflight):
             if not task.done():
