@@ -334,6 +334,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
                 model=model,
                 effort=conversation.effort,
                 emulate_tools=emulate,
+                allow_retry=not body.get("stream"),
                 max_tokens=int_or_none(body.get("max_output_tokens")),
             ),
         )

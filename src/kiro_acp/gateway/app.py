@@ -21,6 +21,7 @@ from kiro_acp.gateway.protocols import (
     openai_completions,
     openai_responses,
 )
+from kiro_acp.gateway.ratelimit import RateLimiter
 
 LOG = logging.getLogger("kiro_acp.gateway")
 
@@ -74,9 +75,26 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
     def get_backend() -> KiroBackend:
         return backend
 
+    limiter = RateLimiter(settings.rate_limit_rpm)
+
+    def throttle(request: Request, key: str | None) -> None:
+        if not limiter.enabled:
+            return
+        client = request.client.host if request.client else "unknown"
+        wait = limiter.acquire(key or client)
+        if wait > 0:
+            raise GatewayError(
+                "Rate limit exceeded for this API key",
+                status=429,
+                error_type="rate_limit_error",
+                code="rate_limited",
+                retry_after=max(1, int(wait + 0.999)),
+            )
+
     async def authorize(request: Request) -> None:
         keys = settings.accepted_keys()
         if not keys:
+            throttle(request, None)
             return
         supplied = None
         auth = request.headers.get("authorization", "")
@@ -112,6 +130,7 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
                     "invalid x-api-key", status=401, error_type="authentication_error"
                 )
             )
+        throttle(request, supplied)
 
     openai_routers = [
         openai_chat.make_router(get_backend, authorize),

@@ -271,6 +271,14 @@ class Agent:
             else:
                 await say(f"invalid value '{level}' for 'output_config.effort'\n")
             return {"stopReason": "end_turn"}
+        if text == "badjson":
+            await say("not json at all")
+            await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 1})
+            return {"stopReason": "end_turn"}
+        if text.startswith("Your previous reply did not satisfy the required output format"):
+            await say('{"ok": true}')
+            await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 1})
+            return {"stopReason": "end_turn"}
         if text == "error":
             raise RpcError(-32603, "Internal error", "Encountered an error in the response stream")
         if text.startswith("error:"):

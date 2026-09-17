@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -116,6 +117,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     add_agent_options(p)
     p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser(
+        "codex-catalog",
+        help="write a Codex model_catalog_json listing Kiro's models in direct tool mode",
+    )
+    p.add_argument("--output", "-o", help="file to write (default: stdout)")
+    p.add_argument(
+        "--codex-version",
+        help="Codex version whose catalogue to use as reference (default: detected)",
+    )
+    p.add_argument("--context-window", type=int, help="context window to advertise for every model")
+    add_agent_options(p)
+    p.set_defaults(func=cmd_codex_catalog)
 
     p = sub.add_parser("doctor", help="check the kiro-cli installation and ACP handshake")
     add_agent_options(p)
@@ -365,6 +379,42 @@ async def cmd_info(args: argparse.Namespace) -> int:
     else:
         for key, value in details.items():
             print(f"{key:<20} {json.dumps(value) if not isinstance(value, str) else value}")
+    return EXIT_OK
+
+
+async def cmd_codex_catalog(args: argparse.Namespace) -> int:
+    from kiro_acp.cli.codex_catalog import (
+        build_catalog,
+        codex_version,
+        fetch_reference_catalog,
+        reference_entry,
+    )
+    from kiro_acp.gateway.protocols.models import context_window
+
+    async with build_agent(args, interactive=False) as agent:
+        info = await agent.discover()
+    kiro_models = [
+        {
+            "id": m.model_id,
+            "description": m.description,
+            "context_length": context_window(m.description),
+        }
+        for m in info.available_models
+    ]
+    version = args.codex_version or codex_version()
+    catalog, ref = await asyncio.to_thread(fetch_reference_catalog, version)
+    reference = reference_entry(catalog)
+    result = build_catalog(kiro_models, reference, context_window=args.context_window)
+    text = json.dumps(result, indent=2) + "\n"
+    if args.output:
+        await asyncio.to_thread(pathlib.Path(args.output).write_text, text)
+        print(
+            f"wrote {len(result['models'])} models to {args.output} (reference: {reference.get('slug')} from {ref})\n"
+            f'add to ~/.codex/config.toml:  model_catalog_json = "{args.output}"',
+            file=sys.stderr,
+        )
+    else:
+        print(text, end="")
     return EXIT_OK
 
 

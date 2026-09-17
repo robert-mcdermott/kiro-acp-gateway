@@ -305,14 +305,23 @@ groups are flattened into ordinary functions, tools it adds mid-session
 (`additional_tools` items) are merged in, and unknown input item types are skipped with a
 log line rather than rejected.
 
-> **GPT model names need a `kiro-` prefix in Codex.** Codex ships its own model
+> **GPT model names need a `kiro-` prefix in Codex, or a catalogue file.** Codex ships its own model
 > catalogue. For names it recognizes (`gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-6-*`, ...) it
 > switches to its "Responses Lite" wire format and *code mode*, sending only `exec`/`wait`
 > code-runner tools instead of `exec_command`, `apply_patch`, and friends. The model then
 > reports that it cannot run commands. Names outside the catalogue get the normal function
 > tools, so put `model = "kiro-gpt-5.6-luna"` in `config.toml`; the gateway strips the
 > `kiro-` (or `kiro/`) prefix before resolving the model. Claude model names are not in
-> Codex's catalogue and need no prefix.
+> Codex's catalogue and need no prefix. The cleaner alternative is a catalogue file:
+>
+> ```bash
+> uv run kiro-acp codex-catalog -o ~/.codex/kiro-models.json
+> ```
+>
+> then `model_catalog_json = "/Users/you/.codex/kiro-models.json"` in `config.toml`.
+> It lists every Kiro model in direct tool mode with Codex's own base instructions
+> (fetched from Codex's published catalogue for your installed version), so native names
+> work and the "model metadata not found" warning disappears.
 
 > **Model choice for harnesses.** Claude Code and Codex send very large system prompts and
 > dozens of tool definitions. Sonnet- and Opus-class Kiro models (and the GPT 5.6 previews)
@@ -430,8 +439,22 @@ to report zeros.
 image URLs are not fetched.
 
 **Per-request headers.** `X-Kiro-Agent` selects a Kiro agent, `X-Kiro-Effort` sets effort,
-and `X-Kiro-Permissions` overrides the permission policy when
-`KIRO_GATEWAY_ALLOW_PERMISSION_OVERRIDE=true`.
+`X-Kiro-Permissions` overrides the permission policy when
+`KIRO_GATEWAY_ALLOW_PERMISSION_OVERRIDE=true`, and `X-Kiro-Workspace` selects the
+directory Kiro works in when it matches `KIRO_GATEWAY_ALLOWED_WORKSPACES`. One gateway
+can therefore serve several projects in agent mode; sessions are pooled per workspace and
+the response's `kiro.workspace` shows which one was used.
+
+**Structured output.** With `response_format` (OpenAI) or `output_config.format`
+(Anthropic) carrying a JSON schema, the reply is fence-stripped and validated. A
+non-streaming request that fails validation is re-prompted once in the same Kiro session
+with the validation errors; the result carries `kiro.schema_valid` and, on failure,
+`kiro.schema_errors`. Streaming requests are validated but not retried.
+
+**Kiro's tool activity** (agent mode) is rendered with arguments, unified diffs for edits,
+output excerpts for commands, and Kiro's plan as a checklist; `KIRO_GATEWAY_TOOL_ACTIVITY_DETAIL=brief`
+reduces it to one line per call. `/v1/models` reports each model's context window
+(`context_length`, Anthropic `max_input_tokens`) parsed from Kiro's descriptions.
 
 ### Configuration reference
 
@@ -440,7 +463,8 @@ the working directory is also read). The most important ones:
 
 | Variable | Default | Description |
 |---|---|---|
-| `KIRO_GATEWAY_WORKSPACE` | current directory | Directory Kiro's own tools operate in (agent mode). Requests cannot change it. Harness clients such as Claude Code run their own tools in their own directory and are unaffected. |
+| `KIRO_GATEWAY_WORKSPACE` | current directory | Default directory Kiro's own tools operate in (agent mode). Harness clients such as Claude Code run their own tools in their own directory and are unaffected. |
+| `KIRO_GATEWAY_ALLOWED_WORKSPACES` | empty | Glob patterns (e.g. `/Users/me/code/*`, `/srv/repos/**`) a request may select with the `X-Kiro-Workspace` header. Empty disables per-request workspaces. |
 | `KIRO_GATEWAY_API_KEY` | empty | Key required on `/v1/*`. Empty means no authentication. |
 | `KIRO_GATEWAY_HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address. |
 | `KIRO_GATEWAY_CLI` | `kiro-cli` | Kiro executable. |
@@ -461,6 +485,9 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_MAX_SESSIONS` | `8` | Live Kiro processes kept for reuse. |
 | `KIRO_GATEWAY_DELETE_SESSIONS` | `true` | Delete Kiro's stored copy of gateway sessions when they are closed (v3). |
 | `KIRO_GATEWAY_MAX_CONCURRENCY` | `4` | Simultaneous turns. |
+| `KIRO_GATEWAY_QUEUE_TIMEOUT` | `60` | Seconds to wait for a free turn slot before answering `503` with `Retry-After`; `0` waits forever. |
+| `KIRO_GATEWAY_RATE_LIMIT_RPM` | `0` | Requests per minute per API key (per client address without keys); `0` disables. Exceeding it returns `429`. |
+| `KIRO_GATEWAY_SHUTDOWN_GRACE` | `10` | Seconds to let in-flight turns cancel on shutdown. |
 | `KIRO_GATEWAY_TIMEOUT` | `900` | Seconds per turn before cancellation. |
 | `KIRO_GATEWAY_SSE_KEEPALIVE` | `15` | Seconds of stream silence before a keepalive (`ping` / SSE comment); `0` disables. |
 | `KIRO_GATEWAY_WARMUP` | `true` | Load the model catalogue in the background at startup. |
@@ -469,6 +496,8 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_SANITIZE_SYSTEM` | `false` | Strip identity and concealment lines from client system prompts (defensive second layer). |
 | `KIRO_GATEWAY_TOOL_MODE` | `emulate` | What to do with client tool definitions: `emulate` (harness mode), `ignore` (drop them and run agent mode), or `reject` (400). |
 | `KIRO_GATEWAY_TOOL_ACTIVITY` | `thought` | `thought`, `text`, or `none`. |
+| `KIRO_GATEWAY_TOOL_ACTIVITY_DETAIL` | `full` | `full` renders arguments, diffs, and output excerpts; `brief` is one line per call. |
+| `KIRO_GATEWAY_VALIDATE_JSON_OUTPUT` | `true` | Validate structured-output replies against the JSON schema and retry once (non-streaming). |
 | `KIRO_GATEWAY_EXPOSE_THOUGHTS` | `true` | Forward Kiro's thinking. |
 | `KIRO_GATEWAY_USAGE_ESTIMATES` | `true` | Estimated token counts. |
 | `KIRO_GATEWAY_SERVE_FS` / `SERVE_TERMINAL` | `false` | Offer client file-system / terminal capabilities to Kiro. |

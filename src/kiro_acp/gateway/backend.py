@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from kiro_acp.acp import (
     MetadataUpdate,
     PermissionPolicy,
     PermissionRule,
+    PlanUpdate,
     Session,
     StopReason,
     TextDelta,
@@ -30,12 +32,14 @@ from kiro_acp.acp import (
     TurnComplete,
 )
 from kiro_acp.acp.session import normalize_effort
-from kiro_acp.acp.types import ModelInfo, ToolCallStatus
+from kiro_acp.acp.types import ModelInfo
+from kiro_acp.gateway.activity import render_completed, render_plan, render_started
 from kiro_acp.gateway.config import Settings
 from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart
 from kiro_acp.gateway.harness_agent import ensure_harness_agent
 from kiro_acp.gateway.limits import StreamLimiter
 from kiro_acp.gateway.prompting import assistant_message, render_prompt
+from kiro_acp.gateway.structured import strip_json_fences, validate_json_reply
 from kiro_acp.gateway.toolcalls import ToolCallParser
 from kiro_acp.gateway.turn import (
     OutputDone,
@@ -124,9 +128,11 @@ class TurnOptions:
     request_id: str = ""
     stop_sequences: list[str] = field(default_factory=list)
     max_tokens: int | None = None
+    allow_retry: bool = False  # non-streaming requests may re-prompt to fix invalid JSON output
+    workspace: str | None = None
 
 
-@dataclass
+@dataclass(eq=False)
 class PooledSession:
     agent: KiroAgent
     session: Session
@@ -134,6 +140,7 @@ class PooledSession:
     mode: str | None
     effort: str | None
     permissions: str
+    workspace: str = ""
     fingerprint: str | None = None
     last_used: float = field(default_factory=time.monotonic)
     busy: bool = False
@@ -161,6 +168,7 @@ class KiroBackend:
         self._models_lock = asyncio.Lock()
         self._reaper: asyncio.Task[None] | None = None
         self._warmup: asyncio.Task[None] | None = None
+        self._active: set[PooledSession] = set()
         self.started = False
 
     # ------------------------------------------------------------------ lifecycle
@@ -191,6 +199,18 @@ class KiroBackend:
 
     async def stop(self) -> None:
         self.started = False
+        active = list(self._active)
+        if active:
+            LOG.info("Shutting down: cancelling %d in-flight Kiro turn(s)", len(active))
+            for pooled in active:
+                with contextlib.suppress(Exception):
+                    await pooled.session.cancel()
+            deadline = time.monotonic() + self.settings.shutdown_grace
+            while self._active and time.monotonic() < deadline:  # noqa: ASYNC110 - polling a set of turns
+                await asyncio.sleep(0.1)
+            for pooled in list(self._active):
+                await pooled.close(delete=self.settings.delete_sessions)
+            self._active.clear()
         if self._warmup is not None and not self._warmup.done():
             self._warmup.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -287,14 +307,13 @@ class KiroBackend:
 
     # ------------------------------------------------------------------ agents
 
-    def _handlers(self, permissions: str) -> ClientHandlers:
+    def _handlers(self, permissions: str, workspace: str | None = None) -> ClientHandlers:
+        root = workspace or self.settings.workspace
         rules = [PermissionRule.parse(rule) for rule in self.settings.permission_rules]
         return ClientHandlers(
             permissions=PermissionPolicy(permissions, rules=rules),
-            filesystem=LocalFileSystem(self.settings.workspace) if self.settings.serve_fs else None,
-            terminals=LocalTerminals(self.settings.workspace)
-            if self.settings.serve_terminal
-            else None,
+            filesystem=LocalFileSystem(root) if self.settings.serve_fs else None,
+            terminals=LocalTerminals(root) if self.settings.serve_terminal else None,
         )
 
     def _make_agent(
@@ -305,6 +324,7 @@ class KiroBackend:
         mode: str | None = None,
         effort: str | None = None,
         engine: str | None = None,
+        workspace: str | None = None,
     ) -> KiroAgent:
         options = KiroLaunchOptions(
             executable=self.settings.cli,
@@ -315,10 +335,11 @@ class KiroBackend:
             trust_all_tools=permissions == "allow-all",
             verbose=1 if self.settings.debug_acp else 0,
         )
+        cwd = workspace or self.settings.workspace
         return KiroAgent(
             options,
-            cwd=self.settings.workspace,
-            handlers=self._handlers(permissions),
+            cwd=cwd,
+            handlers=self._handlers(permissions, cwd),
             client_name="kiro-gateway",
             client_version=__version__,
             request_timeout=120.0,
@@ -337,6 +358,7 @@ class KiroBackend:
             mode=opts.agent,
             effort=opts.effort,
             engine=engine,
+            workspace=opts.workspace,
         )
         try:
             await agent.start()
@@ -363,6 +385,7 @@ class KiroBackend:
             mode=opts.agent,
             effort=opts.effort,
             permissions=permissions,
+            workspace=opts.workspace or self.settings.workspace,
         )
 
     # ------------------------------------------------------------------ session selection
@@ -384,6 +407,7 @@ class KiroBackend:
                         and pooled.mode == opts.agent
                         and pooled.permissions == permissions
                         and pooled.agent.engine == self.engine_for(opts)
+                        and pooled.workspace == (opts.workspace or self.settings.workspace)
                         and (opts.effort is None or pooled.effort == opts.effort)
                         and pooled.agent.client.is_running
                     ):
@@ -442,10 +466,47 @@ class KiroBackend:
             except ValueError as error:
                 raise GatewayError(str(error), code="invalid_effort") from error
         permissions = self.resolve_permissions(opts)
+        if opts.workspace:
+            candidate = os.path.realpath(os.path.expanduser(opts.workspace))
+            if not self.settings.allowed_workspaces and candidate != self.settings.workspace:
+                raise GatewayError(
+                    "Per-request workspaces are disabled (set KIRO_GATEWAY_ALLOWED_WORKSPACES)",
+                    status=403,
+                    error_type="permission_error",
+                    code="workspace_not_allowed",
+                )
+            if not os.path.isdir(candidate):
+                raise GatewayError(
+                    f"Workspace is not a directory: {opts.workspace}",
+                    status=400,
+                    code="invalid_workspace",
+                )
+            if not self.settings.workspace_allowed(candidate):
+                raise GatewayError(
+                    f"Workspace {candidate} is not in KIRO_GATEWAY_ALLOWED_WORKSPACES",
+                    status=403,
+                    error_type="permission_error",
+                    code="workspace_not_allowed",
+                )
+            opts.workspace = candidate
         if opts.agent is None:
             opts.agent = self.settings.harness_agent if opts.emulate_tools else self.settings.agent
-        async with self._turn_slots:
+        try:
+            await asyncio.wait_for(
+                self._turn_slots.acquire(),
+                self.settings.queue_timeout if self.settings.queue_timeout > 0 else None,
+            )
+        except TimeoutError as error:
+            raise GatewayError(
+                f"All {self.settings.max_concurrency} Kiro turn slots are busy; try again later",
+                status=503,
+                error_type="overloaded_error",
+                code="busy",
+                retry_after=max(1, int(self.settings.queue_timeout)),
+            ) from error
+        try:
             pooled, start, fresh = await self._acquire(conversation, opts, permissions)
+            self._active.add(pooled)
             session = pooled.session
             LOG.info(
                 "turn %s: %s engine=%s agent=%s model=%s permissions=%s session=%s%s",
@@ -480,12 +541,14 @@ class KiroBackend:
                 "reused_session": not fresh,
                 "agent": session.mode_id,
                 "model": session.model_id,
+                "workspace": pooled.workspace,
             }
             if session.effort_error:
                 kiro_meta["effort_warning"] = session.effort_error
             finish = "stop"
             error: str | None = None
             completed = False
+            fingerprint: str | None = None
             try:
                 async with contextlib.aclosing(
                     session.prompt(blocks, timeout=self.settings.timeout)
@@ -522,16 +585,29 @@ class KiroBackend:
                                     thought_parts.append(chunk)
                                     yield OutputThought(chunk)
                             case ToolCallEvent(call=call, phase=phase):
-                                line = describe_activity(call, phase)
+                                line = None
+                                if phase == "started":
+                                    line = render_started(
+                                        call, detail=self.settings.tool_activity_detail
+                                    )
+                                elif phase == "completed":
+                                    line = render_completed(
+                                        call, detail=self.settings.tool_activity_detail
+                                    )
                                 if line and self.settings.tool_activity == "thought":
                                     thought_parts.append(line + "\n")
                                     yield OutputThought(line + "\n")
                                 elif line and self.settings.tool_activity == "text":
                                     text_parts.append(line + "\n")
                                     yield OutputText(line + "\n")
-                                kiro_meta.setdefault("tool_calls", []).append(
-                                    call.to_dict()
-                                ) if phase in ("started", "completed") else None
+                                if phase in ("started", "completed"):
+                                    kiro_meta.setdefault("tool_calls", []).append(call.to_dict())
+                            case PlanUpdate(entries=entries):
+                                if entries and self.settings.tool_activity == "thought":
+                                    rendered = render_plan(entries) + "\n"
+                                    thought_parts.append(rendered)
+                                    yield OutputThought(rendered)
+                                kiro_meta["plan"] = [e.model_dump() for e in entries]
                             case MetadataUpdate(data=data):
                                 merge_metadata(kiro_meta, data)
                             case TurnComplete(stop_reason=stop, error=turn_error):
@@ -564,6 +640,30 @@ class KiroBackend:
                         len(kiro_meta["dropped_text_after_tool_calls"]),
                     )
                 thoughts = "".join(thought_parts)
+                if (
+                    conversation.json_output is not None
+                    and not calls
+                    and finish in ("stop", "length")
+                ):
+                    text = strip_json_fences(text)
+                    valid, errors = validate_json_reply(text, conversation.json_output.schema)
+                    if (
+                        not valid
+                        and opts.allow_retry
+                        and self.settings.validate_json_output
+                        and error is None
+                    ):
+                        LOG.info(
+                            "Turn %s: JSON output invalid (%s); retrying once",
+                            opts.request_id,
+                            errors[0] if errors else "?",
+                        )
+                        text, valid, errors = await self._retry_json(
+                            session, text, errors, conversation
+                        )
+                    kiro_meta["schema_valid"] = valid
+                    if errors:
+                        kiro_meta["schema_errors"] = errors[:5]
                 usage = self._usage(conversation, text, thoughts, calls)
                 fingerprint = None
                 if completed and error is None and finish in ("stop", "tool_calls"):
@@ -596,6 +696,32 @@ class KiroBackend:
                     await self._release(
                         pooled, fingerprint if error is None else None, keep=error is None
                     )
+                self._active.discard(pooled)
+        finally:
+            self._turn_slots.release()
+
+    async def _retry_json(
+        self, session: Session, text: str, errors: list[str], conversation: Conversation
+    ) -> tuple[str, bool, list[str]]:
+        """Ask the same session to correct an invalid structured reply (non-streaming only)."""
+        problem = "; ".join(errors[:3]) or "the reply was not valid JSON"
+        schema = conversation.json_output.schema if conversation.json_output else None
+        prompt = (
+            "Your previous reply did not satisfy the required output format: "
+            f"{problem}.\nReply again with only the corrected JSON value and nothing else"
+            + (
+                f", conforming to this JSON Schema:\n{json.dumps(schema, ensure_ascii=False)}"
+                if schema
+                else ""
+            )
+            + "."
+        )
+        result = await session.prompt_text(prompt, timeout=self.settings.timeout)
+        if not result.ok:
+            return text, False, errors
+        corrected = strip_json_fences(result.text)
+        valid, new_errors = validate_json_reply(corrected, schema)
+        return (corrected, valid, new_errors) if valid else (text, False, errors)
 
     def _usage(
         self, conversation: Conversation, text: str, thoughts: str, calls: list[ToolCallPart]
@@ -634,6 +760,7 @@ class KiroBackend:
             "permissions": self.settings.permissions,
             "session_mode": self.settings.session_mode,
             "live_sessions": len(self._pool),
+            "active_turns": len(self._active),
             "models_cached": len(self._models),
             "version": __version__,
         }
@@ -661,15 +788,6 @@ def merge_metadata(target: JSON, data: JSON) -> None:
             target["credits"] = round(target.get("credits", 0.0) + credits, 6)
         else:
             target[key] = value
-
-
-def describe_activity(call, phase: str) -> str | None:
-    if phase == "started":
-        return f"[kiro:{call.kind.value}] {call.title}"
-    if phase == "completed":
-        state = "done" if call.status == ToolCallStatus.COMPLETED else "failed"
-        return f"[kiro:{call.kind.value}] {call.title} — {state}"
-    return None
 
 
 def normalize_model_name(name: str) -> str:

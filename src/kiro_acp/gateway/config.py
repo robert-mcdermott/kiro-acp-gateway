@@ -7,11 +7,12 @@ are read by ``kiro-cli`` itself and must not be shadowed by gateway settings.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from kiro_acp.acp.handlers import POLICY_NAMES
 from kiro_acp.acp.kiro import DEFAULT_ENGINE
@@ -28,6 +29,10 @@ class Settings(BaseSettings):
     cli: str = Field(default="kiro-cli", description="kiro-cli executable")
     engine: str = Field(default=DEFAULT_ENGINE, description="Kiro agent engine: v3 or v2")
     workspace: str = Field(default_factory=os.getcwd, description="Directory Kiro operates in")
+    allowed_workspaces: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description="Glob patterns of directories a request may select with X-Kiro-Workspace (empty disables per-request workspaces)",
+    )
     agent: str | None = Field(default=None, description="Default Kiro agent (ACP mode) id")
     effort: str | None = Field(default=None, description="Default reasoning effort")
     default_model: str | None = Field(
@@ -36,7 +41,7 @@ class Settings(BaseSettings):
     model_fallback: bool = Field(
         default=True, description="Map unknown model names to the default model instead of erroring"
     )
-    model_aliases: dict[str, str] = Field(
+    model_aliases: Annotated[dict[str, str], NoDecode] = Field(
         default_factory=dict,
         description="Extra alias -> Kiro model mappings; keys may be shell globs (e.g. 'gpt-4*': 'gpt-5.6-terra')",
     )
@@ -50,7 +55,7 @@ class Settings(BaseSettings):
     permissions: PermissionMode = Field(
         default="deny", description="Policy for Kiro's own tool permission requests"
     )
-    permission_rules: list[str] = Field(
+    permission_rules: Annotated[list[str], NoDecode] = Field(
         default_factory=list, description="Ordered rules like 'allow:kind=read,search'"
     )
     harness_permissions: PermissionMode = Field(
@@ -83,8 +88,10 @@ class Settings(BaseSettings):
     api_key: str = Field(
         default="", description="Bearer / x-api-key required by API routes when set"
     )
-    api_keys: list[str] = Field(default_factory=list, description="Additional accepted API keys")
-    cors_origins: list[str] = Field(default_factory=list)
+    api_keys: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, description="Additional accepted API keys"
+    )
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
     log_level: str = "info"
     debug_acp: bool = Field(default=False, description="Log raw ACP traffic")
 
@@ -104,6 +111,18 @@ class Settings(BaseSettings):
     # --- execution -----------------------------------------------------------
     max_concurrency: int = Field(default=4, ge=1, description="Max simultaneous Kiro turns")
     timeout: float = Field(default=900.0, description="Max seconds for one turn")
+    queue_timeout: float = Field(
+        default=60.0,
+        description="Seconds a request waits for a free turn slot before 503 (0 = wait forever)",
+    )
+    rate_limit_rpm: int = Field(
+        default=0,
+        ge=0,
+        description="Requests per minute per API key (or client address); 0 disables",
+    )
+    shutdown_grace: float = Field(
+        default=10.0, description="Seconds to wait for in-flight turns to cancel during shutdown"
+    )
     session_mode: Literal["affinity", "stateless"] = Field(
         default="affinity",
         description="affinity: reuse a Kiro session when the conversation prefix matches; stateless: fresh session per request",
@@ -128,6 +147,10 @@ class Settings(BaseSettings):
         default="thought",
         description="How Kiro's own tool activity is surfaced: hidden, inline text, or as reasoning/thinking",
     )
+    tool_activity_detail: Literal["brief", "full"] = Field(
+        default="full",
+        description="brief: one line per tool call; full: arguments, diffs, and output excerpts",
+    )
     expose_thoughts: bool = Field(
         default=True, description="Forward agent thought chunks as reasoning/thinking"
     )
@@ -140,6 +163,10 @@ class Settings(BaseSettings):
     )
     max_prompt_chars: int = Field(
         default=2_000_000, description="Reject prompts larger than this many characters"
+    )
+    validate_json_output: bool = Field(
+        default=True,
+        description="Validate structured-output replies against the requested JSON schema and retry once (non-streaming)",
     )
 
     @field_validator("permissions", "harness_permissions", mode="before")
@@ -170,21 +197,29 @@ class Settings(BaseSettings):
     @field_validator("model_aliases", mode="before")
     @classmethod
     def _parse_aliases(cls, value: object) -> object:
-        if isinstance(value, str) and not value.strip().startswith("{"):
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("{"):
+                return json.loads(text)
             pairs = {}
-            for item in value.split(","):
+            for item in text.split(","):
                 if "=" in item:
                     key, _, target = item.partition("=")
                     pairs[key.strip()] = target.strip()
             return pairs
         return value
 
-    @field_validator("permission_rules", "api_keys", "cors_origins", mode="before")
+    @field_validator(
+        "permission_rules", "api_keys", "cors_origins", "allowed_workspaces", mode="before"
+    )
     @classmethod
     def _parse_list(cls, value: object) -> object:
-        if isinstance(value, str) and not value.strip().startswith("["):
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                return json.loads(text)
             return [
-                item.strip() for item in value.split(";" if ";" in value else ",") if item.strip()
+                item.strip() for item in text.split(";" if ";" in text else ",") if item.strip()
             ]
         return value
 
@@ -193,6 +228,18 @@ class Settings(BaseSettings):
         if self.api_key:
             keys.add(self.api_key)
         return keys
+
+    def workspace_allowed(self, path: str) -> bool:
+        real = os.path.realpath(os.path.expanduser(path))
+        if real == self.workspace:
+            return True
+        for pattern in self.allowed_workspaces:
+            expanded = os.path.expanduser(pattern)
+            if fnmatch.fnmatchcase(real, expanded) or fnmatch.fnmatchcase(real + "/", expanded):
+                return True
+            if expanded.endswith("/**") and (real + "/").startswith(expanded[:-2]):
+                return True
+        return False
 
     def alias_for(self, model: str) -> str | None:
         for pattern, target in self.model_aliases.items():

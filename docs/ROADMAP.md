@@ -91,12 +91,12 @@ them on `session/new`. Normalize entry shapes (HTTP entries need `type: "http"` 
 `headers` as an array or `session/new` hangs), bound `session/new` with a timeout, and
 retry once with `mcpServers: []`.
 
-### 11. Per-request workspace selection (opt-in, allow-listed) — M
+### 11. Per-request workspace selection (opt-in, allow-listed) — DONE — M
 Keep the server-controlled default, but allow `X-Kiro-Workspace` when the value is under
 one of `KIRO_GATEWAY_ALLOWED_WORKSPACES`. Sessions are keyed by workspace in the pool.
 Enables one gateway to serve several projects in agent mode without weakening the jail.
 
-### 12. Structured-output validation — S
+### 12. Structured-output validation — DONE — S
 When `response_format` / `output_config.format` carries a JSON schema, validate the reply
 (after fence stripping) and, on failure, retry once with the validation error appended, then
 return the best effort with `kiro.schema_valid=false`.
@@ -113,11 +113,11 @@ Prometheus `/metrics` (turns by mode/engine/model, latency, credits, active sess
 pool hits) and optional OpenTelemetry spans per turn with the Kiro session id. Propagate
 `traceparent` into ACP `_meta` per the spec's reserved keys.
 
-### 15. Rate limiting and queue timeouts — S
+### 15. Rate limiting and queue timeouts — DONE — S
 Per-key request rate limit and a bounded wait for a concurrency slot
 (`KIRO_GATEWAY_QUEUE_TIMEOUT`) returning 429/503 with `Retry-After` instead of hanging.
 
-### 16. Graceful shutdown — S
+### 16. Graceful shutdown — DONE — S
 On SIGTERM, stop accepting requests, cancel in-flight Kiro turns via `session/cancel`,
 delete gateway-owned sessions, and exit within a bounded time.
 
@@ -136,14 +136,14 @@ mounted workspace, as the recommended isolation story.
 
 ## P5 — Additional things to concider if they improve the gateway
 
-### 19. Richer rendering of Kiro's own tool activity *(pattern)* — S
+### 19. Richer rendering of Kiro's own tool activity *(pattern)* — DONE — S
 Our `tool_activity` lines are just `[kiro:kind] title`. Theirs render arguments as
 `key=value` lines, edits as fenced ```diff blocks from `content[].diff`, `execute` output
 in fenced blocks, and `search` results as a one-line summary, and they fold Kiro's
 todo/plan tool into a `- [ ]` checklist in the reasoning channel. Do the same in
 `describe_activity` for both `thought` and `text` modes, with a size cap per event.
 
-### 20. Context window and limits in `/v1/models` *(pattern, Collomia-relevant)* — S
+### 20. Context window and limits in `/v1/models` *(pattern, Collomia-relevant)* — DONE — S
 Collomia reads `context_length` / `max_context_length` from `/v1/models`; OpenAI SDK
 clients ignore extra fields. Kiro's model descriptions state the window ("1M context
 window"); parse that into `context_length` (default 200k when absent) and add
@@ -169,7 +169,7 @@ command for Claude Code, Codex (`kiro-` prefix or `model_catalog_json`), OpenCod
 Code, Cline/Continue, Hermes, and Collomia, plus the OpenAI and Anthropic SDKs. Each
 example notes the recommended model class and which mode (harness/agent) it exercises.
 
-### 24. Codex model catalogue generator — S
+### 24. Codex model catalogue generator — DONE — S
 `kiro-acp codex-catalog > ~/.codex/kiro-models.json` emitting a `model_catalog_json`
 file for every Kiro model with `tool_mode: "direct"` and `use_responses_lite: false`, so
 Codex can use native names without the `kiro-` prefix and without the fallback-metadata

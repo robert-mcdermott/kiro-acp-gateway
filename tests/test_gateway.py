@@ -15,10 +15,8 @@ from tests.conftest import fake_agent_command
 class FakeKiroBackend(KiroBackend):
     """Backend that launches the scripted fake agent instead of kiro-cli."""
 
-    def _make_agent(self, *, permissions, model=None, mode=None, effort=None, engine=None):
-        agent = super()._make_agent(
-            permissions=permissions, model=model, mode=mode, effort=effort, engine=engine
-        )
+    def _make_agent(self, **kwargs):
+        agent = super()._make_agent(**kwargs)
         agent.options.raw_command = fake_agent_command()
         agent.client.command = agent.options.command()
         return agent
@@ -384,7 +382,8 @@ async def test_chat_kiro_tool_activity_as_reasoning(client: httpx.AsyncClient) -
     )
     message = response.json()["choices"][0]["message"]
     assert message["content"] == "done"
-    assert "[kiro:execute] Running: ls" in message["reasoning_content"]
+    assert "⚙ Running: ls" in message["reasoning_content"]
+    assert "a.txt" in message["reasoning_content"]  # execute output excerpt
     assert response.json()["kiro"]["tool_calls"][0]["title"] == "Running: ls"
 
 
@@ -611,6 +610,230 @@ async def test_max_tokens_enforced_when_enabled(workspace: Path, engine: str) ->
             json={"model": "x", "max_tokens": 5, "messages": [{"role": "user", "content": "long"}]},
         )
         assert anthropic.json()["stop_reason"] == "max_tokens"
+
+
+async def test_structured_output_validation_and_retry(client: httpx.AsyncClient) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    fmt = {"type": "json_schema", "json_schema": {"name": "reply", "schema": schema}}
+    good = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": 'echo: ```json\n{"ok": true}\n```'}],
+            "response_format": fmt,
+        },
+    )
+    body = good.json()
+    assert body["choices"][0]["message"]["content"] == '{"ok": true}'
+    assert body["kiro"]["schema_valid"] is True
+    # First reply is invalid; the gateway re-prompts and the fake agent corrects itself.
+    fixed = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "badjson"}],
+            "response_format": fmt,
+        },
+    )
+    body = fixed.json()
+    assert body["kiro"]["schema_valid"] is True
+    assert body["choices"][0]["message"]["content"] == '{"ok": true}'
+    # Streaming cannot retry; it reports validity only.
+    streamed = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "badjson"}],
+            "response_format": fmt,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+    chunks = [e[1] for e in sse_events(streamed.text) if isinstance(e[1], dict)]
+    assert chunks[-1]["kiro"]["schema_valid"] is False
+    assert any("invalid JSON" in err or "ok" in err for err in chunks[-1]["kiro"]["schema_errors"])
+    anthropic = await client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={
+            "model": "x",
+            "max_tokens": 50,
+            "output_config": {"format": {"type": "json_schema", "schema": schema}},
+            "messages": [{"role": "user", "content": 'echo: {"ok": "nope"}'}],
+        },
+    )
+    assert anthropic.json()["kiro"]["schema_valid"] is True  # retried and corrected
+
+
+async def test_per_request_workspace_allowlist(
+    workspace: Path, engine: str, tmp_path: Path
+) -> None:
+    other = tmp_path / "other-project"
+    other.mkdir()
+    (other / "notes.txt").write_text("other")
+    forbidden = tmp_path / "secret"
+    forbidden.mkdir()
+    settings = make_settings(
+        workspace, engine=engine, allowed_workspaces=[str(tmp_path / "other-*")]
+    )
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=30,
+        ) as http,
+    ):
+        ok = await http.post(
+            "/v1/chat/completions",
+            headers={"X-Kiro-Workspace": str(other)},
+            json={"model": "x", "messages": [{"role": "user", "content": "who"}]},
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["kiro"]["workspace"] == str(other.resolve())
+        denied = await http.post(
+            "/v1/chat/completions",
+            headers={"X-Kiro-Workspace": str(forbidden)},
+            json={"model": "x", "messages": [{"role": "user", "content": "who"}]},
+        )
+        assert (
+            denied.status_code == 403 and denied.json()["error"]["code"] == "workspace_not_allowed"
+        )
+        missing = await http.post(
+            "/v1/chat/completions",
+            headers={"X-Kiro-Workspace": str(tmp_path / "other-missing")},
+            json={"model": "x", "messages": [{"role": "user", "content": "who"}]},
+        )
+        assert missing.status_code == 400
+        # Affinity is per workspace: same conversation in the default workspace starts a new session.
+        reply = ok.json()["choices"][0]["message"]["content"]
+        follow_other = await http.post(
+            "/v1/chat/completions",
+            headers={"X-Kiro-Workspace": str(other)},
+            json={
+                "model": "x",
+                "messages": [
+                    {"role": "user", "content": "who"},
+                    {"role": "assistant", "content": reply},
+                    {"role": "user", "content": "echo: again"},
+                ],
+            },
+        )
+        assert follow_other.json()["kiro"]["reused_session"] is True
+        follow_default = await http.post(
+            "/v1/chat/completions",
+            json={
+                "model": "x",
+                "messages": [
+                    {"role": "user", "content": "who"},
+                    {"role": "assistant", "content": reply},
+                    {"role": "user", "content": "echo: again"},
+                ],
+            },
+        )
+        assert follow_default.json()["kiro"]["reused_session"] is False
+
+
+async def test_workspace_header_disabled_by_default(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    response = await client.post(
+        "/v1/chat/completions",
+        headers={"X-Kiro-Workspace": str(elsewhere)},
+        json={"model": "x", "messages": [{"role": "user", "content": "who"}]},
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "workspace_not_allowed"
+
+
+async def test_rate_limit_per_key(workspace: Path, engine: str) -> None:
+    settings = make_settings(workspace, engine=engine, rate_limit_rpm=2)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=30,
+        ) as http,
+    ):
+        codes = [(await http.get("/v1/models")).status_code for _ in range(3)]
+        assert codes[:2] == [200, 200] and codes[2] == 429
+        third = await http.get("/v1/models")
+        assert third.headers.get("retry-after")
+
+
+async def test_queue_timeout_returns_503(workspace: Path, engine: str) -> None:
+    import asyncio
+
+    settings = make_settings(workspace, engine=engine, max_concurrency=1, queue_timeout=0.3)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=30,
+        ) as http,
+    ):
+        slow = asyncio.create_task(
+            http.post(
+                "/v1/chat/completions",
+                json={"model": "x", "messages": [{"role": "user", "content": "sleep:3"}]},
+            )
+        )
+        for _ in range(100):  # wait until the slow turn actually holds the slot
+            if app.state.backend.health()["active_turns"]:
+                break
+            await asyncio.sleep(0.05)
+        busy = await http.post(
+            "/v1/chat/completions",
+            json={"model": "x", "messages": [{"role": "user", "content": "who"}]},
+        )
+        assert busy.status_code == 503 and busy.json()["error"]["code"] == "busy"
+        assert busy.headers.get("retry-after")
+        assert (await slow).status_code == 200
+
+
+async def test_graceful_shutdown_cancels_turns(workspace: Path, engine: str) -> None:
+    import asyncio
+    import time
+
+    settings = make_settings(workspace, engine=engine, shutdown_grace=5)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=30,
+        ) as http:
+            slow = asyncio.create_task(
+                http.post(
+                    "/v1/chat/completions",
+                    json={"model": "x", "messages": [{"role": "user", "content": "slow"}]},
+                )
+            )
+            await asyncio.sleep(0.5)
+            started = time.monotonic()
+            await app.state.backend.stop()
+            assert time.monotonic() - started < 4
+            response = await slow
+            assert response.status_code == 200
+            assert response.json()["choices"][0]["finish_reason"] == "stop"
+            assert "six" not in response.json()["choices"][0]["message"]["content"]
 
 
 async def test_unsupported_endpoints_return_501(client: httpx.AsyncClient) -> None:

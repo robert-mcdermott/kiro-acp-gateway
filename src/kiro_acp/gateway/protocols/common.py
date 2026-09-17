@@ -116,6 +116,9 @@ def header_options(request: Request, opts: TurnOptions) -> TurnOptions:
         opts.effort = effort
     if permissions:
         opts.permissions = permissions.strip().lower()
+    workspace = request.headers.get("x-kiro-workspace")
+    if workspace:
+        opts.workspace = workspace.strip()
     opts.request_id = request.headers.get("x-request-id") or new_id("req_")
     return opts
 
