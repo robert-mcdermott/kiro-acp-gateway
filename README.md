@@ -368,6 +368,33 @@ passes tools for some other reason (an SDK helper that always attaches them, for
 example), set `KIRO_GATEWAY_TOOL_MODE=ignore` to drop them and force agent mode, or
 `reject` to fail such requests with a 400. Each turn logs which mode and engine it ran on.
 
+### Kiro agents the gateway installs
+
+Harness mode needs Kiro agents that carry no tools of their own, so the gateway ships two
+and installs them itself. Nothing has to be done by hand on a new machine:
+
+| Agent | Used when | Tools |
+|---|---|---|
+| `kiro-gateway-harness-mcp` | `KIRO_GATEWAY_TOOL_MODE=mcp` (default) | only `@harness`, the bridged MCP server |
+| `kiro-gateway-harness` | `emulate` tool mode | none |
+
+- **Every gateway start** writes `~/.kiro/agents/<name>.json` for both when the file is
+  missing (`KIRO_GATEWAY_PROVISION_HARNESS_AGENT=true`, the default).
+- **Files the gateway owns are kept current.** Both carry `managed-by: kiro-gateway` in
+  their description; when such a file differs from what this gateway version would write
+  (after an upgrade, for instance) it is rewritten and the log says `Updated harness agent`.
+- **Your files are never overwritten.** An agent file with the same name but without the
+  marker, or one that fails to parse, is left alone. To customise one, copy it under a new
+  name and point `KIRO_GATEWAY_HARNESS_AGENT` / `KIRO_GATEWAY_HARNESS_AGENT_MCP` at that
+  name, or edit it in place and drop the marker from its description.
+- They show up wherever Kiro lists agents (the Kiro IDE, `kiro-cli`, `uv run kiro-acp
+  agents`) because Kiro reads the global agents directory. Selecting them outside the
+  gateway is harmless: one has no tools, the other only an MCP server that exists inside
+  a gateway session.
+- Set `KIRO_GATEWAY_PROVISION_HARNESS_AGENT=false` where the gateway must not write to the
+  home directory and install the two files with your own tooling; the JSON to install is
+  `kiro_acp.gateway.harness_agent.agent_config(name, mcp=...)`.
+
 ### How requests are translated
 
 **Models.** Requests may name any Kiro model id (`uv run kiro-acp models`). Common aliases
