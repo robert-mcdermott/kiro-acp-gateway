@@ -1370,7 +1370,79 @@ def test_classify_kiro_error(message: str, status: int, code: str) -> None:
     assert (got_status, got_code) == (status, code)
 
 
-async def test_responses_streaming(client: httpx.AsyncClient) -> None:
+async def test_codex_catalog_served_for_client_version(client: httpx.AsyncClient) -> None:
+    """Codex asks GET /models?client_version=... and expects its own catalogue format."""
+    backend = client.app.state.backend  # type: ignore[attr-defined]
+
+    def fake_fetch(version):
+        return {
+            "models": [
+                {
+                    "slug": "gpt-5.6-luna",
+                    "base_instructions": "You are Codex.",
+                    "tool_mode": "code",
+                    "shell_type": "unified_exec",
+                }
+            ]
+        }, f"rust-v{version}"
+
+    backend.codex_catalog._fetch = fake_fetch
+    response = await client.get("/v1/models?client_version=0.154.0")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    slugs = [m["slug"] for m in body["models"]]
+    assert "claude-opus-4.8" in slugs and "gpt-5.6-terra" in slugs
+    entry = body["models"][0]
+    assert entry["tool_mode"] == "direct" and entry["use_responses_lite"] is False
+    assert entry["base_instructions"] == "You are Codex."
+    # Ordinary clients still get the OpenAI list; the Anthropic router never serves it.
+    plain = await client.get("/v1/models")
+    assert plain.json()["object"] == "list"
+    anthropic = await client.get("/anthropic/v1/models?client_version=0.154.0")
+    assert "models" not in anthropic.json()
+
+
+async def test_codex_catalog_falls_back_when_offline(client: httpx.AsyncClient) -> None:
+    backend = client.app.state.backend  # type: ignore[attr-defined]
+
+    def failing_fetch(version):
+        raise RuntimeError("no network")
+
+    backend.codex_catalog._fetch = failing_fetch
+    response = await client.get("/v1/models?client_version=0.154.0")
+    assert response.status_code == 200 and response.json()["object"] == "list"
+
+
+async def test_acp_errors_outside_turns_are_classified(client: httpx.AsyncClient) -> None:
+    from kiro_acp.acp.errors import ACPProcessError
+
+    backend = client.app.state.backend  # type: ignore[attr-defined]
+
+    async def not_logged_in(*, force: bool = False):
+        raise ACPProcessError("agent stdout closed\nerror: You are not logged in, please log in")
+
+    backend.models = not_logged_in
+    response = await client.get("/v1/models")
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "kiro_auth"
+
+
+async def test_metrics_endpoint(client: httpx.AsyncClient) -> None:
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": "x", "messages": [{"role": "user", "content": "echo: hi"}]},
+    )
+    await client.post("/v1/chat/completions", json={"model": "x", "messages": []})
+    unauthenticated = await client.get("/metrics", headers={"Authorization": ""})
+    assert unauthenticated.status_code == 401
+    response = await client.get("/metrics")
+    assert response.status_code == 200
+    text = response.text
+    assert 'kiro_gateway_turns_total{mode="agent"' in text and 'finish="stop"} 1' in text
+    assert "kiro_gateway_turn_seconds_bucket" in text
+    assert "kiro_gateway_errors_total{" in text
+    assert "kiro_gateway_live_sessions" in text
+
     response = await client.post(
         "/v1/responses", json={"model": "x", "input": "thought", "stream": True}
     )

@@ -80,8 +80,13 @@ def build_catalog(
     reference: dict[str, Any],
     *,
     context_window: int | None = None,
+    tool_mode: str = "direct",
 ) -> dict[str, Any]:
-    """Clone ``reference`` for each Kiro model with direct tools and the standard wire format."""
+    """Clone ``reference`` for each Kiro model with direct tools and the standard wire format.
+
+    ``tool_mode="code"`` keeps Codex's code mode (one freeform ``exec`` tool), which the
+    gateway also supports; ``direct`` (default) gives plain function tools.
+    """
     entries = []
     for index, model in enumerate(kiro_models):
         entry = copy.deepcopy(reference)
@@ -91,7 +96,7 @@ def build_catalog(
         entry["priority"] = index + 1
         entry["visibility"] = "list"
         entry["supported_in_api"] = True
-        entry["tool_mode"] = "direct"
+        entry["tool_mode"] = tool_mode
         entry["use_responses_lite"] = False
         entry["prefer_websockets"] = False
         entry["supports_search_tool"] = False

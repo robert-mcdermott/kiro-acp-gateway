@@ -1,0 +1,14 @@
+# ~/.codex/config.toml — Codex CLI via the gateway (Responses API).
+# Then: export KIRO_GATEWAY_KEY=your-gateway-key && codex
+model = "gpt-5.6-luna"          # any Kiro model id
+model_provider = "kiro"
+
+[model_providers.kiro]
+name = "Kiro via kiro-gateway"
+base_url = "http://127.0.0.1:8000/v1"
+env_key = "KIRO_GATEWAY_KEY"
+wire_api = "responses"
+
+# The gateway answers Codex's catalogue request, so every Kiro model gets metadata without
+# a model_catalog_json file. To force plain function tools instead of code mode, set
+# KIRO_GATEWAY_CODEX_TOOL_MODE=direct (the default) on the gateway.

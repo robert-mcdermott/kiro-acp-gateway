@@ -454,18 +454,19 @@ styles work:
   `custom_tool_call_output` items Codex sends back. Freeform tools with a `grammar`
   format carry the grammar into the tool description.
 
-> **Optional: a Codex catalogue file.** Codex prints "Model metadata for `<model>` not
-> found" for names outside its catalogue and picks generic defaults for them. To give it
-> real metadata for every Kiro model (and direct tools instead of code mode, if you prefer
-> them), generate a catalogue:
->
-> ```bash
-> uv run kiro-acp codex-catalog -o ~/.codex/kiro-models.json
-> ```
->
-> then `model_catalog_json = "/Users/you/.codex/kiro-models.json"` in `config.toml`. A
-> `kiro-` (or `kiro/`) prefix on a model name (`kiro-gpt-5.6-luna`) also takes a name out of
-> Codex's catalogue; the gateway strips it before resolving the model.
+**Model metadata comes from the gateway.** Codex asks each provider for
+`GET /v1/models?client_version=<its version>` in its own catalogue format. The gateway
+answers with an entry for every Kiro model (Codex's real base instructions for that
+version, fetched once from Codex's published catalogue and cached), so Codex shows no
+"Model metadata for `<model>` not found" warning and needs no `model_catalog_json`. By
+default those entries select Codex's direct function tools; `KIRO_GATEWAY_CODEX_TOOL_MODE=code`
+keeps code mode, and `KIRO_GATEWAY_CODEX_CATALOG=false` turns the endpoint off. Offline,
+the gateway falls back to the plain model list and Codex uses its built-in defaults.
+
+> The older ways still work: `uv run kiro-acp codex-catalog -o ~/.codex/kiro-models.json`
+> writes the same catalogue to a file for `model_catalog_json`, and a `kiro-` (or `kiro/`)
+> prefix on a model name (`kiro-gpt-5.6-luna`) takes it out of Codex's own catalogue; the
+> gateway strips the prefix before resolving the model.
 
 > **Model choice for harnesses.** With the default `mcp` tool mode the model makes native
 > tool calls, so any current Kiro model works. In `emulate` mode, Sonnet- and Opus-class
@@ -680,6 +681,9 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_EXPOSE_THOUGHTS` | `true` | Forward Kiro's thinking. |
 | `KIRO_GATEWAY_USAGE_ESTIMATES` | `true` | Estimated token counts. |
 | `KIRO_GATEWAY_MAX_IMAGE_BYTES` | `5242880` | Reject image inputs larger than this (decoded bytes) with `400 image_too_large`; an oversized image can wedge a Kiro session. `0` disables. Images are dropped with a note when the agent does not advertise image input. |
+| `KIRO_GATEWAY_CODEX_CATALOG` | `true` | Answer Codex's `GET /v1/models?client_version=...` with a Codex model catalogue for every Kiro model. |
+| `KIRO_GATEWAY_CODEX_TOOL_MODE` | `direct` | Tool style that catalogue selects for Codex: `direct` function tools or `code` mode. |
+| `KIRO_GATEWAY_METRICS` | `true` | Serve Prometheus metrics at `/metrics` (same authentication as `/v1`). |
 | `KIRO_GATEWAY_SERVE_FS` / `SERVE_TERMINAL` | `false` | Offer client file-system / terminal capabilities to Kiro. |
 | `KIRO_GATEWAY_DEBUG_ACP` | `false` | Log raw ACP traffic. |
 | `KIRO_GATEWAY_LOG_LEVEL` | `info` | Log level. |
@@ -722,6 +726,49 @@ A model refusal or content filter is not an error: the reply completes with
 `kiro` block carries `refusal: {category, explanation, recommendedModel}` and, when Kiro
 suggests one, `recommended_model`. Every response's `kiro` block also reports
 `contextUsagePercentage` (how full the Kiro session's context is) and `credits`.
+
+### Running it as a service, in Docker, and monitoring it
+
+**User service.** `scripts/install-service.sh [env-file]` installs a launchd agent
+(macOS) or a `systemd --user` unit (Linux) that runs `uv run kiro-gateway` from this
+checkout and loads `.env`. `kiro-gateway --print-service launchd|systemd` prints the unit
+for review without installing it. Logs go to `~/Library/Logs/kiro-gateway.log` or
+`journalctl --user -u kiro-gateway`.
+
+**Docker or Podman.** The `Dockerfile` installs Kiro CLI and the gateway bound to
+`0.0.0.0:8000`, with `/workspace` as the agent-mode directory and `/home/kiro/.kiro` for
+Kiro's login. The commands are identical for Podman; substitute `podman` for `docker`
+(verified with Podman 5.8 on Apple Silicon, arm64 image):
+
+```bash
+docker build -t kiro-acp-gateway .
+# Log Kiro in once; the device flow prints a URL and code to open in any browser.
+docker run -it --rm -v kiro-home:/home/kiro/.kiro kiro-acp-gateway kiro-cli login --use-device-flow
+docker run -d --name kiro-gateway -p 127.0.0.1:8000:8000 \
+  -v kiro-home:/home/kiro/.kiro -v "$PWD":/workspace:z \
+  -e KIRO_GATEWAY_API_KEY=change-me kiro-acp-gateway
+curl -s http://127.0.0.1:8000/health
+```
+
+The named volume keeps the login and Kiro's agent files across container restarts; `:z`
+on the workspace mount is needed on SELinux hosts and harmless elsewhere. Any gateway
+setting can be passed with `-e KIRO_GATEWAY_...`. Harness clients (Claude Code, Codex)
+keep running their tools on the host; only Kiro's own tools are confined to the mounted
+workspace. Until Kiro is logged in, `/health` answers but `/v1/models` returns
+`502 kiro_auth` with Kiro's "not logged in" message. Podman ignores the `HEALTHCHECK`
+line (OCI format); build with `--format docker` if you want it.
+
+**Metrics.** `GET /metrics` (same key as `/v1`) serves Prometheus text:
+`kiro_gateway_turns_total{mode,engine,model,finish}`, `kiro_gateway_turn_seconds`
+(histogram), `kiro_gateway_credits_total{model}`, `kiro_gateway_session_reuse_total`,
+`kiro_gateway_errors_total{code,status}`, and gauges for active turns, live sessions, and
+cached models. `GET /health` stays unauthenticated for liveness probes.
+
+**CI and packaging.** `.github/workflows/ci.yml` runs ruff and the test suite (fake ACP
+agent, no Kiro needed) on Linux and macOS for Python 3.11 to 3.13 and builds wheels with
+`uv build`; an optional integration job runs `KIRO_INTEGRATION=1` tests on a self-hosted
+runner with a logged-in Kiro CLI. `examples/clients/` holds ready-to-use configurations
+for every verified client.
 
 ### Security
 

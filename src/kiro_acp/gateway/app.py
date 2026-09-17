@@ -6,12 +6,13 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from kiro_acp import __version__
+from kiro_acp.acp.errors import ACPError
 from kiro_acp.gateway.backend import GatewayError, KiroBackend
 from kiro_acp.gateway.config import Settings
 from kiro_acp.gateway.protocols import (
@@ -155,6 +156,14 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
     async def health():
         return backend.health()
 
+    if settings.metrics:
+
+        @app.get("/metrics", dependencies=[Depends(authorize)])
+        async def metrics():
+            return PlainTextResponse(
+                backend.render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8"
+            )
+
     @app.api_route("/api/hello", methods=["GET", "HEAD"])
     async def api_hello():
         # Claude Code probes this path to check connectivity.
@@ -212,6 +221,7 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
 
     @app.exception_handler(GatewayError)
     async def gateway_error(request: Request, error: GatewayError):
+        backend.metrics.record_error(error.code or "error", error.status)
         if error.status >= 500:
             LOG.error(
                 "%s %s -> %s: %s", request.method, request.url.path, error.status, error.message
@@ -233,6 +243,12 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
             error_body(request, str(error), "invalid_request_error", "validation_error"),
             status_code=422,
         )
+
+    @app.exception_handler(ACPError)
+    async def acp_error(request: Request, error: ACPError):
+        # Kiro could not be started or answered with an error outside a turn (for example
+        # the model catalogue probe on a machine where kiro-cli is not logged in).
+        return await gateway_error(request, GatewayError.from_kiro(str(error)))
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, error: Exception):

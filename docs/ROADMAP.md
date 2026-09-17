@@ -108,10 +108,11 @@ estimates, keeping `usage.estimated` accurate.
 
 ## P4 — operations and tooling
 
-### 14. Metrics and tracing — M
+### 14. Metrics and tracing — DONE — M
 Prometheus `/metrics` (turns by mode/engine/model, latency, credits, active sessions,
 pool hits) and optional OpenTelemetry spans per turn with the Kiro session id. Propagate
 `traceparent` into ACP `_meta` per the spec's reserved keys.
+*Done (2026-09-17):* Prometheus `/metrics` with turns, latency histogram, credits, session reuse, errors, and gauges; no OpenTelemetry (no dependency wanted) and no `traceparent` propagation yet.
 
 ### 15. Rate limiting and queue timeouts — DONE — S
 Per-key request rate limit and a bounded wait for a concurrency slot
@@ -128,13 +129,14 @@ delete gateway-owned sessions, and exit within a bounded time.
 - `kiro-acp models --engine both` to diff catalogues.
 - Shell completion (`--print-completion bash|zsh|fish`).
 
-### 18. Packaging and CI — S
+### 18. Packaging and CI — DONE — S
 GitHub Actions: `uv sync`, ruff, pytest (fake agent), optional integration job gated on a
 secret. Publish wheels with `uv build`; `uv tool install kiro-acp-gateway` from PyPI.
 Add a `Dockerfile` that installs kiro-cli and runs the gateway bound to `0.0.0.0` with a
 mounted workspace, as the recommended isolation story.
 
 ## P5 — Additional things to concider if they improve the gateway
+*Done (2026-09-17):* GitHub Actions matrix (Linux/macOS, 3.11–3.13) with ruff, pytest, `uv build` artifacts, optional self-hosted integration job; `Dockerfile` + `.dockerignore`, built and run with Podman 5.8 (arm64): kiro-cli 2.22 inside, `/health` up, unauthenticated Kiro reported as `502 kiro_auth`.
 
 ### 19. Richer rendering of Kiro's own tool activity *(pattern)* — DONE — S
 Our `tool_activity` lines are just `[kiro:kind] title`. Theirs render arguments as
@@ -163,11 +165,12 @@ addition to config-file discovery for Claude Code (`~/.claude.json` projects,
 (`.cursor/mcp.json`, `.vscode/mcp.json`), and Kilo. Agent mode only; harness mode keeps
 the tool-less agent. Normalize HTTP entries (`type: "http"`, `headers` as an array).
 
-### 23. Client example configurations *(pattern)* — S
+### 23. Client example configurations *(pattern)* — DONE — S
 An `examples/clients/` directory with ready-to-use configs and a one-line verification
 command for Claude Code, Codex (`kiro-` prefix or `model_catalog_json`), OpenCode, Kilo
 Code, Cline/Continue, Hermes, and Collomia, plus the OpenAI and Anthropic SDKs. Each
 example notes the recommended model class and which mode (harness/agent) it exercises.
+*Done (2026-09-17):* `examples/clients/` with curl, requests, OpenAI and Anthropic SDK scripts, Claude Code launcher, Codex and OpenCode configs, and a generic OpenAI-compatible guide.
 
 ### 24. Codex model catalogue generator — DONE — S
 `kiro-acp codex-catalog > ~/.codex/kiro-models.json` emitting a `model_catalog_json`
@@ -181,7 +184,7 @@ rendered back as `custom_tool_call` items on `/v1/responses` and `type: "custom"
 calls on `/v1/chat/completions`, so catalogue GPT names work without the prefix or the
 catalogue file. Both remain useful for model metadata and for forcing direct tools.
 
-### 28. Serve the Codex model catalogue from the gateway — S
+### 28. Serve the Codex model catalogue from the gateway — DONE — S
 Codex 0.154 fetches `GET <base_url>/models?client_version=<ver>` from every provider and
 expects the catalogue format (`{"models": [...]}` with `slug`, `tool_mode`, instructions);
 it logs a decode error against our OpenAI-style list and falls back to built-in metadata.
@@ -189,16 +192,18 @@ Answer that exact request shape (the `client_version` query parameter identifies
 the output of the `codex-catalog` generator so Codex gets metadata for every Kiro model
 with zero client configuration and no "model metadata not found" warning. Cache the
 upstream reference catalogue per Codex version and fall back gracefully offline.
+*Done (2026-09-17):* `GET /v1/models?client_version=` returns a Codex catalogue built from the cached reference entry for that Codex version; verified live with Codex 0.154 (no decode or metadata warnings). `KIRO_GATEWAY_CODEX_CATALOG`, `KIRO_GATEWAY_CODEX_TOOL_MODE`.
 
 ### 25. Document and PDF inputs *(pattern)* — S
 Anthropic `document` blocks with base64 PDF sources and OpenAI `file` parts: extract text
 locally (`pypdf`, optional dependency) and attach it as a text block; keep the current
 clear error when extraction is unavailable.
 
-### 26. Service installation scripts *(pattern)* — S
+### 26. Service installation scripts *(pattern)* — DONE — S
 `scripts/install-service.sh` generating a launchd plist (macOS) or systemd unit (Linux)
 that runs `uv run kiro-gateway` with an env file, plus `kiro-gateway --print-service`
 to emit the unit for review. Pairs with the Dockerfile in #18.
+*Done (2026-09-17):* `scripts/install-service.sh` and `kiro-gateway --print-service launchd|systemd` (unit-tested; launchd form verified on this machine).
 
 ### 27. Per-model notes in the model listing — S
 Record observed capabilities in `/v1/models` descriptions and in

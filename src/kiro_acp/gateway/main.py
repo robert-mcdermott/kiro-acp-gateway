@@ -55,7 +55,68 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--print-config", action="store_true", help="print the effective configuration and exit"
     )
+    parser.add_argument(
+        "--print-service",
+        choices=("launchd", "systemd"),
+        help="print a launchd plist / systemd unit that runs this gateway with an env file, and exit",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="env file the printed service loads (default .env in the project directory)",
+    )
     return parser
+
+
+def service_definition(kind: str, *, env_file: str, project_dir: str) -> str:
+    """A launchd plist or systemd unit that runs ``uv run kiro-gateway`` from ``project_dir``."""
+    import shutil
+
+    uv = shutil.which("uv") or "uv"
+    env_path = os.path.abspath(os.path.join(project_dir, env_file))
+    if kind == "systemd":
+        return f"""[Unit]
+Description=Kiro ACP Gateway (OpenAI/Anthropic-compatible API for Kiro CLI)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={project_dir}
+EnvironmentFile=-{env_path}
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={uv} run kiro-gateway
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+"""
+    # launchd reads no env file, so the wrapper shell sources it.
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.kiro.acp-gateway</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>[ -f "{env_path}" ] &amp;&amp; set -a &amp;&amp; . "{env_path}" &amp;&amp; set +a; exec "{uv}" run kiro-gateway</string>
+  </array>
+  <key>WorkingDirectory</key><string>{project_dir}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>{os.path.expanduser("~/.local/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>{os.path.expanduser("~/Library/Logs/kiro-gateway.log")}</string>
+  <key>StandardErrorPath</key><string>{os.path.expanduser("~/Library/Logs/kiro-gateway.log")}</string>
+</dict>
+</plist>
+"""
 
 
 def settings_from_args(args: argparse.Namespace) -> Settings:
@@ -81,6 +142,12 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.print_service:
+        print(
+            service_definition(args.print_service, env_file=args.env_file, project_dir=os.getcwd()),
+            end="",
+        )
+        return 0
     try:
         settings = settings_from_args(args)
     except Exception as error:  # pydantic validation

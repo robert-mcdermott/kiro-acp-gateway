@@ -150,3 +150,15 @@ def test_missing_executable(tmp_path: Path) -> None:
     )
     assert proc.returncode == 4
     assert "not found" in proc.stderr
+
+
+def test_gateway_print_service_units(tmp_path, monkeypatch, capsys) -> None:
+    from kiro_acp.gateway.main import main as gateway_main
+
+    monkeypatch.chdir(tmp_path)
+    assert gateway_main(["--print-service", "systemd", "--env-file", "gw.env"]) == 0
+    unit = capsys.readouterr().out
+    assert "[Service]" in unit and str(tmp_path / "gw.env") in unit and "kiro-gateway" in unit
+    assert gateway_main(["--print-service", "launchd"]) == 0
+    plist = capsys.readouterr().out
+    assert "<plist" in plist and "dev.kiro.acp-gateway" in plist and str(tmp_path) in plist

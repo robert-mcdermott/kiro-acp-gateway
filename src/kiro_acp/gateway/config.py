@@ -87,6 +87,19 @@ class Settings(BaseSettings):
     )
     serve_terminal: bool = Field(default=False, description="Advertise terminal/* to the agent")
 
+    codex_catalog: bool = Field(
+        default=True,
+        description="Answer Codex's GET /v1/models?client_version=... with a Codex model catalogue "
+        "(metadata for every Kiro model, no client configuration needed)",
+    )
+    codex_tool_mode: Literal["direct", "code"] = Field(
+        default="direct",
+        description="Tool style the served Codex catalogue selects: direct function tools or Codex's code mode",
+    )
+    metrics: bool = Field(
+        default=True, description="Serve Prometheus metrics at /metrics (same auth as /v1)"
+    )
+
     # --- HTTP ----------------------------------------------------------------
     host: str = "127.0.0.1"
     port: int = 8000

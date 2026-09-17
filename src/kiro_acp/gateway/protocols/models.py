@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from kiro_acp.gateway.backend import GatewayError, KiroBackend
+from kiro_acp.gateway.codex import codex_models
 from kiro_acp.gateway.protocols.common import now
 
 _WINDOW_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([km])\b[^.]*context", re.I)
@@ -94,6 +95,22 @@ def make_router(backend_dep, auth_dep, *, style: str = "auto") -> APIRouter:
     async def list_models(request: Request, backend: KiroBackend = Depends(backend_dep)):
         models = await backend.models()
         created = now()
+        client_version = request.query_params.get("client_version")
+        if client_version is not None and backend.settings.codex_catalog and style != "anthropic":
+            # Codex CLI asking for its catalogue format (see gateway/codex.py).
+            reference = await backend.codex_catalog.reference(client_version or None)
+            if reference is not None:
+                entries = [
+                    {
+                        "id": m.model_id,
+                        "description": m.description,
+                        "context_length": context_window(m.description),
+                    }
+                    for m in models
+                ]
+                return JSONResponse(
+                    codex_models(entries, reference, tool_mode=backend.settings.codex_tool_mode)
+                )
         rows = catalogue(backend, models)
         if anthropic_style(request):
             data = [

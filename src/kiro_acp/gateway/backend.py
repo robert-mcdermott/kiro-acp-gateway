@@ -37,11 +37,13 @@ from kiro_acp.acp import (
 from kiro_acp.acp.session import normalize_effort
 from kiro_acp.acp.types import ModelInfo
 from kiro_acp.gateway.activity import render_completed, render_plan, render_started
+from kiro_acp.gateway.codex import CodexCatalogCache
 from kiro_acp.gateway.config import Settings
 from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart, ToolDef
 from kiro_acp.gateway.harness_agent import ensure_harness_agent
 from kiro_acp.gateway.limits import StreamLimiter
 from kiro_acp.gateway.mcp_turn import END, BridgeCall, PendingTurn
+from kiro_acp.gateway.metrics import Metrics
 from kiro_acp.gateway.prompting import assistant_message, render_prompt
 from kiro_acp.gateway.structured import strip_json_fences, validate_json_reply
 from kiro_acp.gateway.toolbridge.broker import BridgeSession, ToolBridgeBroker
@@ -201,6 +203,7 @@ class TurnOptions:
     permissions: str | None = None
     emulate_tools: bool = False
     request_id: str = ""
+    started: float = 0.0
     stop_sequences: list[str] = field(default_factory=list)
     max_tokens: int | None = None
     allow_retry: bool = False  # non-streaming requests may re-prompt to fix invalid JSON output
@@ -251,6 +254,8 @@ class KiroBackend:
         self._reaper: asyncio.Task[None] | None = None
         self._warmup: asyncio.Task[None] | None = None
         self._harness_dir: str | None = None
+        self.metrics = Metrics()
+        self.codex_catalog = CodexCatalogCache()
         self._active: set[PooledSession] = set()
         self.bridge_broker: ToolBridgeBroker | None = None
         self.started = False
@@ -623,6 +628,7 @@ class KiroBackend:
         if conversation.total_chars() > self.settings.max_prompt_chars:
             raise GatewayError("Prompt too large", status=413, code="prompt_too_large")
         check_image_sizes(conversation, self.settings.max_image_bytes)
+        opts.started = time.monotonic()
         if opts.effort:
             try:
                 opts.effort = normalize_effort(opts.effort)
@@ -852,6 +858,7 @@ class KiroBackend:
                 fingerprint = None
                 if completed and error is None and finish in ("stop", "tool_calls"):
                     fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
+                self._record_turn(opts, pooled, finish, kiro_meta, fresh)
                 yield OutputDone(
                     finish=finish,
                     text=text,
@@ -1039,6 +1046,7 @@ class KiroBackend:
             fingerprint = None
             if keep and finish in ("stop", "tool_calls"):
                 fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
+            self._record_turn(opts, pooled, finish, kiro_meta, fresh)
             yield OutputDone(
                 finish=finish,
                 text=text,
@@ -1111,6 +1119,26 @@ class KiroBackend:
             "total_tokens": prompt_tokens + completion_tokens,
             "estimated": True,
         }
+
+    def _record_turn(
+        self, opts: TurnOptions, pooled: PooledSession, finish: str, kiro_meta: JSON, fresh: bool
+    ) -> None:
+        self.metrics.record_turn(
+            mode="harness" if opts.emulate_tools else "agent",
+            engine=pooled.agent.engine,
+            model=pooled.session.model_id or opts.model or "default",
+            finish=finish,
+            seconds=time.monotonic() - opts.started if opts.started else 0.0,
+            credits=float(kiro_meta.get("credits", 0.0) or 0.0),
+            reused=not fresh,
+        )
+
+    def render_metrics(self) -> str:
+        return self.metrics.render(
+            active_turns=len(self._active),
+            live_sessions=len(self._pool),
+            models_cached=len(self._models),
+        )
 
     def health(self) -> JSON:
         return {
