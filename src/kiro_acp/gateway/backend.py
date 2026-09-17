@@ -1,0 +1,547 @@
+"""Kiro backend for the gateway: process/session management and turn execution."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import time
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+
+from kiro_acp import __version__
+from kiro_acp.acp import (
+    ACPError,
+    ACPRemoteError,
+    ClientHandlers,
+    KiroAgent,
+    KiroLaunchOptions,
+    LocalFileSystem,
+    LocalTerminals,
+    MetadataUpdate,
+    PermissionPolicy,
+    PermissionRule,
+    Session,
+    StopReason,
+    TextDelta,
+    ThoughtDelta,
+    ToolCallEvent,
+    TurnComplete,
+)
+from kiro_acp.acp.session import normalize_effort
+from kiro_acp.acp.types import ModelInfo, ToolCallStatus
+from kiro_acp.gateway.config import Settings
+from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart
+from kiro_acp.gateway.harness_agent import ensure_harness_agent
+from kiro_acp.gateway.prompting import assistant_message, render_prompt
+from kiro_acp.gateway.toolcalls import ToolCallParser
+from kiro_acp.gateway.turn import (
+    OutputDone,
+    OutputEvent,
+    OutputText,
+    OutputThought,
+    OutputToolCall,
+    estimate_tokens,
+)
+
+LOG = logging.getLogger("kiro_acp.gateway.backend")
+
+
+class GatewayError(Exception):
+    """An error with an HTTP status and an API-style error type."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 400,
+        error_type: str | None = None,
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.error_type = error_type or ("invalid_request_error" if status < 500 else "api_error")
+        self.code = code
+
+
+@dataclass(slots=True)
+class TurnOptions:
+    """Per-request knobs resolved by the protocol adapters."""
+
+    model: str | None
+    effort: str | None = None
+    agent: str | None = None
+    permissions: str | None = None
+    emulate_tools: bool = False
+    request_id: str = ""
+
+
+@dataclass
+class PooledSession:
+    agent: KiroAgent
+    session: Session
+    model: str
+    mode: str | None
+    effort: str | None
+    permissions: str
+    fingerprint: str | None = None
+    last_used: float = field(default_factory=time.monotonic)
+    busy: bool = False
+    created: float = field(default_factory=time.monotonic)
+
+    async def close(self, *, delete: bool = False) -> None:
+        if delete:
+            with contextlib.suppress(Exception):
+                await self.agent.close_session(self.session, delete=True)
+        with contextlib.suppress(Exception):
+            await self.agent.close()
+
+
+class KiroBackend:
+    """Owns Kiro processes and turns conversations into output events."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._turn_slots = asyncio.Semaphore(settings.max_concurrency)
+        self._pool: dict[str, PooledSession] = {}
+        self._pool_lock = asyncio.Lock()
+        self._models: list[ModelInfo] = []
+        self._default_model: str | None = None
+        self._models_at = 0.0
+        self._models_lock = asyncio.Lock()
+        self._reaper: asyncio.Task[None] | None = None
+        self.started = False
+
+    # ------------------------------------------------------------------ lifecycle
+
+    async def start(self) -> None:
+        if self.settings.harness_agent and self.settings.provision_harness_agent:
+            try:
+                ensure_harness_agent(self.settings.harness_agent)
+            except OSError as error:
+                LOG.warning(
+                    "Could not provision harness agent %r: %s", self.settings.harness_agent, error
+                )
+        self.started = True
+        self._reaper = asyncio.create_task(self._reap_idle(), name="kiro-session-reaper")
+
+    async def stop(self) -> None:
+        self.started = False
+        if self._reaper is not None:
+            self._reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reaper
+        async with self._pool_lock:
+            pooled = list(self._pool.values())
+            self._pool.clear()
+        await asyncio.gather(
+            *(p.close(delete=self.settings.delete_sessions) for p in pooled), return_exceptions=True
+        )
+
+    async def _reap_idle(self) -> None:
+        while True:
+            await asyncio.sleep(min(30.0, max(5.0, self.settings.session_idle_ttl / 4)))
+            now = time.monotonic()
+            expired: list[PooledSession] = []
+            async with self._pool_lock:
+                for key, pooled in list(self._pool.items()):
+                    if not pooled.busy and now - pooled.last_used > self.settings.session_idle_ttl:
+                        expired.append(self._pool.pop(key))
+            for pooled in expired:
+                LOG.info("Closing idle Kiro session %s", pooled.session.session_id)
+                await pooled.close(delete=self.settings.delete_sessions)
+
+    # ------------------------------------------------------------------ models
+
+    async def models(self, *, force: bool = False) -> list[ModelInfo]:
+        async with self._models_lock:
+            fresh = time.monotonic() - self._models_at < self.settings.models_cache_ttl
+            if self._models and fresh and not force:
+                return self._models
+            agent = self._make_agent(permissions="deny")
+            try:
+                await agent.start()
+                info = await agent.discover(delete=self.settings.delete_sessions)
+            finally:
+                await agent.close()
+            self._models = list(info.available_models)
+            self._default_model = info.current_model_id
+            self._models_at = time.monotonic() if self._models else 0.0
+            if not self._models:
+                LOG.warning(
+                    "Kiro advertised no models; model names will be passed through unchanged"
+                )
+            return self._models
+
+    async def default_model(self) -> str | None:
+        if self.settings.default_model:
+            return self.settings.default_model
+        if self._default_model is None:
+            await self.models()
+        return self._default_model
+
+    async def resolve_model(self, requested: str | None) -> str | None:
+        """Map a client model name to a Kiro model id (``None`` = leave Kiro's default)."""
+        models = await self.models()
+        ids = [m.model_id for m in models]
+        if not requested:
+            return await self.default_model()
+        if not ids:
+            return requested if requested.lower() not in ("kiro", "default", "auto") else None
+        if requested in ids:
+            return requested
+        alias = self.settings.alias_for(requested)
+        if alias and alias in ids:
+            return alias
+        normalized = normalize_model_name(requested)
+        for candidate in ids:
+            if normalize_model_name(candidate) == normalized:
+                return candidate
+        for candidate in ids:
+            if normalized and normalize_model_name(candidate).startswith(normalized):
+                return candidate
+        if requested.lower() in ("kiro", "default", "auto"):
+            return await self.default_model()
+        if self.settings.model_fallback:
+            fallback = await self.default_model()
+            LOG.info("Model %r not available; using %r", requested, fallback)
+            return fallback
+        raise GatewayError(
+            f"Unknown model {requested!r}. Available: {', '.join(ids)}",
+            status=404,
+            error_type="not_found_error",
+            code="model_not_found",
+        )
+
+    # ------------------------------------------------------------------ agents
+
+    def _handlers(self, permissions: str) -> ClientHandlers:
+        rules = [PermissionRule.parse(rule) for rule in self.settings.permission_rules]
+        return ClientHandlers(
+            permissions=PermissionPolicy(permissions, rules=rules),
+            filesystem=LocalFileSystem(self.settings.workspace) if self.settings.serve_fs else None,
+            terminals=LocalTerminals(self.settings.workspace)
+            if self.settings.serve_terminal
+            else None,
+        )
+
+    def _make_agent(
+        self,
+        *,
+        permissions: str,
+        model: str | None = None,
+        mode: str | None = None,
+        effort: str | None = None,
+    ) -> KiroAgent:
+        options = KiroLaunchOptions(
+            executable=self.settings.cli,
+            engine=self.settings.engine,
+            model=model,
+            effort=effort,
+            agent=mode,
+            trust_all_tools=permissions == "allow-all",
+            verbose=1 if self.settings.debug_acp else 0,
+        )
+        return KiroAgent(
+            options,
+            cwd=self.settings.workspace,
+            handlers=self._handlers(permissions),
+            client_name="kiro-gateway",
+            client_version=__version__,
+            request_timeout=120.0,
+        )
+
+    async def _spawn(self, opts: TurnOptions, permissions: str) -> PooledSession:
+        agent = self._make_agent(
+            permissions=permissions, model=opts.model, mode=opts.agent, effort=opts.effort
+        )
+        try:
+            await agent.start()
+            session = await agent.new_session(
+                model=opts.model,
+                mode=opts.agent,
+                effort=opts.effort,
+                autopilot=(permissions == "allow-all") if self.settings.engine == "v3" else None,
+            )
+        except ACPRemoteError as error:
+            await agent.close()
+            raise GatewayError(
+                str(error), status=400 if "Unknown" in str(error) else 502, code="kiro_error"
+            ) from error
+        except ACPError as error:
+            await agent.close()
+            raise GatewayError(
+                str(error), status=502, error_type="api_error", code="kiro_unavailable"
+            ) from error
+        return PooledSession(
+            agent=agent,
+            session=session,
+            model=opts.model,
+            mode=opts.agent,
+            effort=opts.effort,
+            permissions=permissions,
+        )
+
+    # ------------------------------------------------------------------ session selection
+
+    async def _acquire(
+        self, conversation: Conversation, opts: TurnOptions, permissions: str
+    ) -> tuple[PooledSession, int, bool]:
+        """Return ``(pooled, start_index, fresh)``."""
+        if self.settings.session_mode == "affinity":
+            start = conversation.prefix_length_for_affinity()
+            if start > 0:
+                key = conversation.fingerprint(start)
+                async with self._pool_lock:
+                    pooled = self._pool.get(key)
+                    if (
+                        pooled is not None
+                        and not pooled.busy
+                        and pooled.model == opts.model
+                        and pooled.mode == opts.agent
+                        and pooled.permissions == permissions
+                        and (opts.effort is None or pooled.effort == opts.effort)
+                        and pooled.agent.client.is_running
+                    ):
+                        pooled.busy = True
+                        del self._pool[key]
+                        LOG.debug(
+                            "Reusing session %s for prefix %s", pooled.session.session_id, key[:12]
+                        )
+                        return pooled, start, False
+        pooled = await self._spawn(opts, permissions)
+        pooled.busy = True
+        return pooled, 0, True
+
+    async def _release(self, pooled: PooledSession, fingerprint: str | None, *, keep: bool) -> None:
+        pooled.busy = False
+        pooled.last_used = time.monotonic()
+        if not keep or fingerprint is None or self.settings.session_mode != "affinity":
+            await pooled.close(delete=self.settings.delete_sessions)
+            return
+        pooled.fingerprint = fingerprint
+        evicted: list[PooledSession] = []
+        async with self._pool_lock:
+            self._pool[fingerprint] = pooled
+            while len(self._pool) > self.settings.max_sessions:
+                oldest_key = min(self._pool, key=lambda k: self._pool[k].last_used)
+                if oldest_key == fingerprint and len(self._pool) == 1:
+                    break
+                evicted.append(self._pool.pop(oldest_key))
+        for item in evicted:
+            await item.close(delete=self.settings.delete_sessions)
+
+    # ------------------------------------------------------------------ turns
+
+    def resolve_permissions(self, opts: TurnOptions) -> str:
+        if opts.permissions:
+            if not self.settings.allow_permission_override:
+                raise GatewayError(
+                    "Permission overrides are disabled (KIRO_GATEWAY_ALLOW_PERMISSION_OVERRIDE)",
+                    status=403,
+                    error_type="permission_error",
+                )
+            return opts.permissions
+        if opts.emulate_tools:
+            return self.settings.harness_permissions
+        return self.settings.permissions
+
+    async def run(
+        self, conversation: Conversation, opts: TurnOptions
+    ) -> AsyncIterator[OutputEvent]:
+        """Execute one turn, yielding output events. Cancels Kiro if the consumer stops early."""
+        if conversation.total_chars() > self.settings.max_prompt_chars:
+            raise GatewayError("Prompt too large", status=413, code="prompt_too_large")
+        if opts.effort:
+            try:
+                opts.effort = normalize_effort(opts.effort)
+            except ValueError as error:
+                raise GatewayError(str(error), code="invalid_effort") from error
+        permissions = self.resolve_permissions(opts)
+        if opts.agent is None:
+            opts.agent = self.settings.harness_agent if opts.emulate_tools else self.settings.agent
+        async with self._turn_slots:
+            pooled, start, fresh = await self._acquire(conversation, opts, permissions)
+            session = pooled.session
+            blocks = render_prompt(
+                conversation, start=start, include_system=fresh, emulate_tools=opts.emulate_tools
+            )
+            parser = ToolCallParser(enabled=opts.emulate_tools)
+            text_parts: list[str] = []
+            thought_parts: list[str] = []
+            calls: list[ToolCallPart] = []
+            kiro_meta: JSON = {
+                "session_id": session.session_id,
+                "engine": self.settings.engine,
+                "reused_session": not fresh,
+                "agent": session.mode_id,
+                "model": session.model_id,
+            }
+            if session.effort_error:
+                kiro_meta["effort_warning"] = session.effort_error
+            finish = "stop"
+            error: str | None = None
+            completed = False
+            try:
+                async with contextlib.aclosing(
+                    session.prompt(blocks, timeout=self.settings.timeout)
+                ) as turn:
+                    async for event in turn:
+                        match event:
+                            case TextDelta(text=chunk):
+                                text, new_calls = parser.feed(chunk)
+                                if text:
+                                    text_parts.append(text)
+                                    yield OutputText(text)
+                                for parsed in new_calls:
+                                    part = parsed.to_part()
+                                    calls.append(part)
+                                    yield OutputToolCall(part)
+                            case ThoughtDelta(text=chunk):
+                                if self.settings.expose_thoughts:
+                                    thought_parts.append(chunk)
+                                    yield OutputThought(chunk)
+                            case ToolCallEvent(call=call, phase=phase):
+                                line = describe_activity(call, phase)
+                                if line and self.settings.tool_activity == "thought":
+                                    thought_parts.append(line + "\n")
+                                    yield OutputThought(line + "\n")
+                                elif line and self.settings.tool_activity == "text":
+                                    text_parts.append(line + "\n")
+                                    yield OutputText(line + "\n")
+                                kiro_meta.setdefault("tool_calls", []).append(
+                                    call.to_dict()
+                                ) if phase in ("started", "completed") else None
+                            case MetadataUpdate(data=data):
+                                merge_metadata(kiro_meta, data)
+                            case TurnComplete(stop_reason=stop, error=turn_error):
+                                completed = True
+                                tail, tail_calls = parser.flush()
+                                if tail:
+                                    text_parts.append(tail)
+                                    yield OutputText(tail)
+                                for parsed in tail_calls:
+                                    part = parsed.to_part()
+                                    calls.append(part)
+                                    yield OutputToolCall(part)
+                                finish, error = map_stop(stop, turn_error, bool(calls))
+                text = "".join(text_parts)
+                if calls:
+                    text = text.rstrip()
+                thoughts = "".join(thought_parts)
+                usage = self._usage(conversation, text, thoughts, calls)
+                fingerprint = None
+                if completed and error is None and finish in ("stop", "tool_calls"):
+                    fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
+                yield OutputDone(
+                    finish=finish,
+                    text=text,
+                    thoughts=thoughts,
+                    tool_calls=calls,
+                    usage=usage,
+                    kiro=kiro_meta,
+                    error=error,
+                    session_id=session.session_id,
+                )
+            finally:
+                if not completed:
+                    LOG.info(
+                        "Turn %s ended early; cancelling Kiro session %s",
+                        opts.request_id,
+                        session.session_id,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.cancel()
+                    await self._release(pooled, None, keep=False)
+                else:
+                    await self._release(
+                        pooled, fingerprint if error is None else None, keep=error is None
+                    )
+
+    def _usage(
+        self, conversation: Conversation, text: str, thoughts: str, calls: list[ToolCallPart]
+    ) -> JSON:
+        if not self.settings.usage_estimates:
+            return {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "estimated": True,
+            }
+        prompt_tokens = estimate_tokens(conversation.system) + sum(
+            estimate_tokens(m.text())
+            + sum(estimate_tokens(json.dumps(c.arguments)) for c in m.tool_calls)
+            + sum(estimate_tokens(r.content) for r in m.tool_results)
+            for m in conversation.messages
+        )
+        completion_tokens = (
+            estimate_tokens(text)
+            + estimate_tokens(thoughts)
+            + sum(estimate_tokens(json.dumps(c.arguments)) for c in calls)
+        )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "estimated": True,
+        }
+
+    def health(self) -> JSON:
+        return {
+            "status": "ok" if self.started else "starting",
+            "backend": "kiro-cli-acp",
+            "engine": self.settings.engine,
+            "workspace": self.settings.workspace,
+            "permissions": self.settings.permissions,
+            "session_mode": self.settings.session_mode,
+            "live_sessions": len(self._pool),
+            "models_cached": len(self._models),
+            "version": __version__,
+        }
+
+
+def map_stop(stop: StopReason, error: str | None, has_calls: bool) -> tuple[str, str | None]:
+    if error or stop == StopReason.ERROR:
+        return "error", error or "Kiro turn failed"
+    if stop == StopReason.CANCELLED:
+        return "cancelled", None
+    if stop == StopReason.REFUSAL:
+        return "refusal", None
+    if stop in (StopReason.MAX_TOKENS, StopReason.MAX_TURN_REQUESTS):
+        return "length", None
+    return ("tool_calls" if has_calls else "stop"), None
+
+
+def merge_metadata(target: JSON, data: JSON) -> None:
+    for key, value in data.items():
+        if key == "meteringUsage" and isinstance(value, list):
+            target.setdefault("meteringUsage", []).extend(value)
+            credits = sum(
+                float(item.get("value", 0) or 0) for item in value if isinstance(item, dict)
+            )
+            target["credits"] = round(target.get("credits", 0.0) + credits, 6)
+        else:
+            target[key] = value
+
+
+def describe_activity(call, phase: str) -> str | None:
+    if phase == "started":
+        return f"[kiro:{call.kind.value}] {call.title}"
+    if phase == "completed":
+        state = "done" if call.status == ToolCallStatus.COMPLETED else "failed"
+        return f"[kiro:{call.kind.value}] {call.title} — {state}"
+    return None
+
+
+def normalize_model_name(name: str) -> str:
+    """``claude-sonnet-4-5-20250929`` -> ``claude-sonnet-4.5``; ``claude-3-5-haiku-latest`` -> ``claude-3.5-haiku``."""
+    import re
+
+    value = name.strip().lower()
+    value = re.sub(r"-(\d{8})$", "", value)
+    value = re.sub(r"-(latest|preview)$", "", value)
+    value = re.sub(r"@\d+$", "", value)
+    value = re.sub(r"(?<=\d)-(?=\d)", ".", value)
+    return value
