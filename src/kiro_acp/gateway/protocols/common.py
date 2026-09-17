@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import re
 import time
@@ -14,7 +15,7 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from kiro_acp.gateway.backend import GatewayError, TurnOptions
-from kiro_acp.gateway.conversation import JSON, ImagePart
+from kiro_acp.gateway.conversation import JSON, ImagePart, ToolCallPart, ToolDef
 
 _DATA_URL_RE = re.compile(
     r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?:;charset=[\w-]+)?;base64,(?P<data>.+)$", re.DOTALL
@@ -178,3 +179,56 @@ def text_of_content(content: Any) -> str:
 
 
 StreamFactory = Callable[[], Awaitable[None]]
+
+
+CUSTOM_INPUT_SCHEMA: JSON = {
+    "type": "object",
+    "properties": {
+        "input": {
+            "type": "string",
+            "description": "The complete raw tool input as plain text. Freeform: not JSON-encoded, "
+            "not quoted, no code fences.",
+        }
+    },
+    "required": ["input"],
+}
+
+
+def custom_tool(raw: JSON) -> ToolDef:
+    """OpenAI *custom* (freeform) tool: the model sends one raw text input instead of JSON.
+
+    Codex's code mode exposes its whole workspace (``exec_command``, ``apply_patch``...) through a
+    single custom tool named ``exec`` that takes JavaScript source, so dropping these leaves the
+    model without any way to touch files. They are modelled as a function with a single ``input``
+    string and rendered back to the client as ``custom_tool_call`` items.
+    """
+    description = str(raw.get("description") or "").rstrip()
+    notes = [
+        "This is a freeform tool: pass the entire raw input text as the single `input` string argument.",
+    ]
+    fmt = raw.get("format")
+    if isinstance(fmt, dict) and fmt.get("type") == "grammar" and fmt.get("definition"):
+        syntax = fmt.get("syntax") or "grammar"
+        notes.append(f"The input must conform to this {syntax} grammar:\n{fmt['definition']}")
+    return ToolDef(
+        name=str(raw["name"]),
+        description=(description + "\n\n" if description else "") + "\n".join(notes),
+        parameters=copy.deepcopy(CUSTOM_INPUT_SCHEMA),
+        kind="custom",
+    )
+
+
+def custom_input(call: ToolCallPart) -> str:
+    """Recover the raw text of a custom tool call from the model's JSON arguments."""
+    args = call.arguments
+    if isinstance(args, str):
+        return args
+    if isinstance(args, dict):
+        if not args:
+            return ""
+        if isinstance(args.get("input"), str):
+            return args["input"]
+        if len(args) == 1:
+            (value,) = args.values()
+            return value if isinstance(value, str) else json_dumps(value)
+    return json_dumps(args)

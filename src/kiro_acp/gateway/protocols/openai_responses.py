@@ -26,6 +26,8 @@ from kiro_acp.gateway.conversation import (
     ToolResultPart,
 )
 from kiro_acp.gateway.protocols.common import (
+    custom_input,
+    custom_tool,
     header_options,
     image_from_data_url,
     int_or_none,
@@ -111,7 +113,17 @@ def parse_input(conversation: Conversation, value: Any) -> list[ToolDef]:
                 conversation.messages[-1].parts.append(part)
             else:
                 conversation.messages.append(Message("assistant", [part]))
-        elif kind == "function_call_output":
+        elif kind == "custom_tool_call":
+            part = ToolCallPart(
+                id=str(item.get("call_id") or item.get("id") or new_id("call_")),
+                name=str(item.get("name", "")),
+                arguments={"input": str(item.get("input") or "")},
+            )
+            if conversation.messages and conversation.messages[-1].role == "assistant":
+                conversation.messages[-1].parts.append(part)
+            else:
+                conversation.messages.append(Message("assistant", [part]))
+        elif kind in ("function_call_output", "custom_tool_call_output"):
             output = item.get("output")
             result = ToolResultPart(
                 call_id=str(item.get("call_id", "")),
@@ -172,6 +184,9 @@ def parse_tools(body: JSON) -> list[ToolDef]:
         if raw.get("type") == "namespace" and isinstance(raw.get("tools"), list):
             # Codex groups related functions under a namespace; expose them by their own names.
             tools.extend(parse_tools({"tools": raw["tools"]}))
+            continue
+        if raw.get("type") == "custom" and raw.get("name"):
+            tools.append(custom_tool(raw))
             continue
         if raw.get("type") != "function":
             continue
@@ -303,6 +318,29 @@ def function_item(item_id: str, call: ToolCallPart, status: str = "completed") -
     }
 
 
+def custom_item(item_id: str, call: ToolCallPart, status: str = "completed") -> JSON:
+    return {
+        "id": item_id,
+        "type": "custom_tool_call",
+        "status": status,
+        "call_id": call.id,
+        "name": call.name,
+        "input": custom_input(call),
+    }
+
+
+def call_item(
+    item_id: str, call: ToolCallPart, custom: set[str], status: str = "completed"
+) -> JSON:
+    if call.name in custom:
+        return custom_item(item_id, call, status)
+    return function_item(item_id, call, status)
+
+
+def custom_tool_names(conversation: Conversation) -> set[str]:
+    return {t.name for t in conversation.tools if t.kind == "custom"}
+
+
 def reasoning_item(item_id: str, text: str) -> JSON:
     return {
         "id": item_id,
@@ -368,7 +406,15 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
         if done.finish == "error":
             raise GatewayError.from_kiro(done.error or "Kiro turn failed")
         text, thoughts, calls = done.text, done.thoughts, done.tool_calls
-        finalize(response, text, thoughts, calls, done, backend.settings.expose_thoughts)
+        finalize(
+            response,
+            text,
+            thoughts,
+            calls,
+            done,
+            backend.settings.expose_thoughts,
+            custom_tool_names(conversation),
+        )
         if store:
             STORE.put(response_id, continued(conversation, text, calls), response)
         return JSONResponse(response)
@@ -414,14 +460,17 @@ def finalize(
     calls: list[ToolCallPart],
     done: OutputDone,
     expose_thoughts: bool,
+    custom: set[str] | None = None,
 ) -> None:
+    custom = custom or set()
     output: list[JSON] = []
     if thoughts and expose_thoughts:
         output.append(reasoning_item(new_id("rs_"), thoughts))
     if text or not calls:
         output.append(message_item(new_id("msg_"), text))
     for call in calls:
-        output.append(function_item(new_id("fc_"), call))
+        prefix = "ctc_" if call.name in custom else "fc_"
+        output.append(call_item(new_id(prefix), call, custom))
     response["output"] = output
     response["usage"] = usage_json(done.usage, reasoning_tokens=len(thoughts) // 4)
     response["kiro"] = done.kiro
@@ -455,6 +504,7 @@ async def stream_response(
     msg_id: str | None = None
     rs_id: str | None = None
     expose_thoughts = backend.settings.expose_thoughts
+    custom = custom_tool_names(conversation)
     try:
         async with aclosing(backend.run(conversation, opts)) as events:
             async for event in events:
@@ -559,6 +609,34 @@ async def stream_response(
                             msg_id = None
                             output_index += 1
                         calls.append(call)
+                        if call.name in custom:
+                            ctc_id = new_id("ctc_")
+                            raw_input = custom_input(call)
+                            yield emit(
+                                "response.output_item.added",
+                                output_index=output_index,
+                                item={**custom_item(ctc_id, call, "in_progress"), "input": ""},
+                            )
+                            yield emit(
+                                "response.custom_tool_call_input.delta",
+                                item_id=ctc_id,
+                                output_index=output_index,
+                                delta=raw_input,
+                            )
+                            yield emit(
+                                "response.custom_tool_call_input.done",
+                                item_id=ctc_id,
+                                output_index=output_index,
+                                input=raw_input,
+                            )
+                            yield emit(
+                                "response.output_item.done",
+                                output_index=output_index,
+                                item=custom_item(ctc_id, call),
+                            )
+                            response["output"].append(custom_item(ctc_id, call))
+                            output_index += 1
+                            continue
                         fc_id = new_id("fc_")
                         yield emit(
                             "response.output_item.added",

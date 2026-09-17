@@ -1168,6 +1168,135 @@ async def test_responses_codex_item_types(client: httpx.AsyncClient) -> None:
     assert fc and fc[0]["name"] == "spawn_agent"
 
 
+EXEC_TOOL = {
+    "type": "custom",
+    "name": "exec",
+    "description": "Run JavaScript to call nested tools such as tools.exec_command(...).",
+    "format": {
+        "type": "grammar",
+        "syntax": "lark",
+        "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/",
+    },
+}
+EXEC_JS = 'await tools.apply_patch("*** Begin Patch\\n*** End Patch");'
+
+
+async def test_responses_custom_tool_roundtrip(client: httpx.AsyncClient) -> None:
+    """Codex code mode: the whole workspace is one freeform ``custom`` tool named ``exec``."""
+    call = json.dumps({"name": "exec", "arguments": {"input": EXEC_JS}})
+    body = {
+        "model": "x",
+        "tools": [EXEC_TOOL, {"type": "function", "name": "wait", "parameters": {}}],
+        "input": "echo: <tool_call>" + call + "</tool_call>",
+    }
+    response = await client.post("/v1/responses", json=body)
+    assert response.status_code == 200, response.text
+    items = [i for i in response.json()["output"] if i["type"] == "custom_tool_call"]
+    assert items and items[0]["name"] == "exec" and items[0]["input"] == EXEC_JS
+    assert items[0]["id"].startswith("ctc_") and items[0]["call_id"]
+    assert not [i for i in response.json()["output"] if i["type"] == "function_call"]
+    follow = await client.post(
+        "/v1/responses",
+        json={
+            **body,
+            "input": [
+                {"role": "user", "content": body["input"]},
+                items[0],
+                {"type": "custom_tool_call_output", "call_id": items[0]["call_id"], "output": "ok"},
+                {"role": "user", "content": "history?"},
+            ],
+        },
+    )
+    assert follow.status_code == 200, follow.text
+    assert follow.json()["kiro"]["reused_session"] is True
+
+
+async def test_responses_custom_tool_streaming(client: httpx.AsyncClient) -> None:
+    call = json.dumps({"name": "exec", "arguments": {"input": EXEC_JS}})
+    response = await client.post(
+        "/v1/responses",
+        json={
+            "model": "x",
+            "tools": [EXEC_TOOL],
+            "stream": True,
+            "input": "echo: <tool_call>" + call + "</tool_call>",
+        },
+    )
+    events = sse_events(response.text)
+    names = [e[0] for e in events]
+    assert "response.custom_tool_call_input.delta" in names
+    done = next(e[1] for e in events if e[0] == "response.custom_tool_call_input.done")
+    assert done["input"] == EXEC_JS
+    assert "response.function_call_arguments.done" not in names
+    final = events[-1][1]["response"]
+    assert final["output"][-1]["type"] == "custom_tool_call"
+
+
+async def test_responses_custom_tool_over_mcp_bridge(mcp_client: httpx.AsyncClient) -> None:
+    """The bridge advertises a custom tool as a one-argument function; the reply is a custom_tool_call."""
+    js = json.dumps({"input": EXEC_JS})
+    response = await mcp_client.post(
+        "/v1/responses", json={"model": "x", "tools": [EXEC_TOOL], "input": "mcp:exec:" + js}
+    )
+    assert response.status_code == 200, response.text
+    items = [i for i in response.json()["output"] if i["type"] == "custom_tool_call"]
+    assert items and items[0]["input"] == EXEC_JS
+    second = await mcp_client.post(
+        "/v1/responses",
+        json={
+            "model": "x",
+            "tools": [EXEC_TOOL],
+            "input": [
+                {"role": "user", "content": "mcp:exec:" + js},
+                *response.json()["output"],
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": items[0]["call_id"],
+                    "output": "done",
+                },
+            ],
+        },
+    )
+    assert second.status_code == 200, second.text
+    text = second.json()["output"][-1]["content"][0]["text"]
+    assert "result: done" in text
+
+
+async def test_chat_custom_tool(client: httpx.AsyncClient) -> None:
+    call = json.dumps({"name": "exec", "arguments": {"input": EXEC_JS}})
+    tools = [{"type": "custom", "custom": {"name": "exec", "description": "Run JS"}}]
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "tools": tools,
+            "messages": [{"role": "user", "content": "echo: <tool_call>" + call + "</tool_call>"}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    message = response.json()["choices"][0]["message"]
+    tool_call = message["tool_calls"][0]
+    assert tool_call["type"] == "custom" and tool_call["custom"] == {
+        "name": "exec",
+        "input": EXEC_JS,
+    }
+    follow = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "echo: <tool_call>" + call + "</tool_call>"},
+                message,
+                {"role": "tool", "tool_call_id": tool_call["id"], "content": "ok"},
+                {"role": "user", "content": "history?"},
+            ],
+        },
+    )
+    assert follow.status_code == 200, follow.text
+    assert follow.json()["kiro"]["reused_session"] is True
+
+
 async def test_responses_streaming(client: httpx.AsyncClient) -> None:
     response = await client.post(
         "/v1/responses", json={"model": "x", "input": "thought", "stream": True}

@@ -25,6 +25,8 @@ from kiro_acp.gateway.conversation import (
     ToolResultPart,
 )
 from kiro_acp.gateway.protocols.common import (
+    custom_input,
+    custom_tool,
     header_options,
     image_from_data_url,
     int_or_none,
@@ -65,6 +67,16 @@ def build_conversation(body: JSON) -> Conversation:
                 parts.append(TextPart(text))
             for call in raw.get("tool_calls") or []:
                 if not isinstance(call, dict):
+                    continue
+                if call.get("type") == "custom":
+                    custom = call.get("custom") or {}
+                    parts.append(
+                        ToolCallPart(
+                            id=str(call.get("id") or new_id("call_")),
+                            name=str(custom.get("name", "")),
+                            arguments={"input": str(custom.get("input") or "")},
+                        )
+                    )
                     continue
                 function = call.get("function") or {}
                 parts.append(
@@ -154,6 +166,11 @@ def parse_tools(body: JSON) -> list[ToolDef]:
     for raw in body.get("tools") or []:
         if not isinstance(raw, dict):
             continue
+        if raw.get("type") == "custom":
+            custom = raw.get("custom") or raw
+            if isinstance(custom, dict) and custom.get("name"):
+                tools.append(custom_tool(custom))
+            continue
         if raw.get("type", "function") != "function":
             continue
         function = raw.get("function") or raw
@@ -217,12 +234,22 @@ def finish_reason(finish: str) -> str:
     }.get(finish, "stop")
 
 
-def tool_call_json(call: ToolCallPart, index: int | None = None) -> JSON:
-    data: JSON = {
-        "id": call.id,
-        "type": "function",
-        "function": {"name": call.name, "arguments": json_dumps(call.arguments)},
-    }
+def tool_call_json(
+    call: ToolCallPart, index: int | None = None, custom: set[str] | None = None
+) -> JSON:
+    data: JSON
+    if custom and call.name in custom:
+        data = {
+            "id": call.id,
+            "type": "custom",
+            "custom": {"name": call.name, "input": custom_input(call)},
+        }
+    else:
+        data = {
+            "id": call.id,
+            "type": "function",
+            "function": {"name": call.name, "arguments": json_dumps(call.arguments)},
+        }
     if index is not None:
         data["index"] = index
     return data
@@ -289,6 +316,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
         text = ""
         thoughts = ""
         calls: list[ToolCallPart] = []
+        custom = {t.name for t in conversation.tools if t.kind == "custom"}
         done: OutputDone | None = None
         async with aclosing(backend.run(conversation, opts)) as events:
             async for event in events:
@@ -313,7 +341,7 @@ def make_router(backend_dep, auth_dep) -> APIRouter:
         if thoughts and expose_thoughts:
             message["reasoning_content"] = thoughts
         if calls:
-            message["tool_calls"] = [tool_call_json(c) for c in calls]
+            message["tool_calls"] = [tool_call_json(c, custom=custom) for c in calls]
         response: JSON = {
             "id": completion_id,
             "object": "chat.completion",
@@ -345,6 +373,8 @@ async def stream_chat(
     include_usage: bool,
     expose_thoughts: bool,
 ) -> AsyncIterator[str]:
+    custom = {t.name for t in conversation.tools if t.kind == "custom"}
+
     def chunk(delta: JSON, finish: str | None = None, usage: JSON | None = None) -> str:
         payload: JSON = {
             "id": completion_id,
@@ -370,7 +400,7 @@ async def stream_chat(
                         if text and expose_thoughts:
                             yield chunk({"reasoning_content": text})
                     case OutputToolCall(call=call):
-                        yield chunk({"tool_calls": [tool_call_json(call, call_index)]})
+                        yield chunk({"tool_calls": [tool_call_json(call, call_index, custom)]})
                         call_index += 1
                     case OutputDone(finish=finish, error=error, usage=usage, kiro=kiro):
                         if finish == "error":

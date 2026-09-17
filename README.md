@@ -214,7 +214,7 @@ unauthenticated; every `/v1/*` route requires the key as `Authorization: Bearer 
 | Endpoint | Protocol |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI Chat Completions (streaming and non-streaming, tools, images, `reasoning_effort`, `response_format`) |
-| `POST /v1/responses` | OpenAI Responses (`input` items, `instructions`, function tools, `previous_response_id`, streaming events) |
+| `POST /v1/responses` | OpenAI Responses (`input` items, `instructions`, function and freeform `custom` tools, `previous_response_id`, streaming events) |
 | `POST /v1/completions` | Legacy OpenAI Completions (`prompt`, `echo`, streaming) |
 | `POST /v1/messages` | Anthropic Messages (streaming and non-streaming, tools, images, thinking blocks, `output_config.effort`) |
 | `POST /v1/messages/count_tokens` | Anthropic token counting (estimated) |
@@ -290,7 +290,7 @@ one agent touches your files.
 
 ```toml
 # ~/.codex/config.toml
-model = "claude-sonnet-4.6"       # or "kiro-gpt-5.6-luna": prefix GPT names with kiro- (see note)
+model = "gpt-5.6-luna"            # any Kiro model id; Claude names work too
 model_provider = "kiro"
 
 [model_providers.kiro]
@@ -300,28 +300,32 @@ env_key = "KIRO_GATEWAY_KEY"
 wire_api = "responses"
 ```
 
-Then `export KIRO_GATEWAY_KEY=your-gateway-key` and run `codex`. Codex's `namespace` tool
-groups are flattened into ordinary functions, tools it adds mid-session
-(`additional_tools` items) are merged in, and unknown input item types are skipped with a
-log line rather than rejected.
+Then `export KIRO_GATEWAY_KEY=your-gateway-key` and run `codex`. Both of Codex's tool
+styles work:
 
-> **GPT model names need a `kiro-` prefix in Codex, or a catalogue file.** Codex ships its own model
-> catalogue. For names it recognizes (`gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-6-*`, ...) it
-> switches to its "Responses Lite" wire format and *code mode*, sending only `exec`/`wait`
-> code-runner tools instead of `exec_command`, `apply_patch`, and friends. The model then
-> reports that it cannot run commands. Names outside the catalogue get the normal function
-> tools, so put `model = "kiro-gpt-5.6-luna"` in `config.toml`; the gateway strips the
-> `kiro-` (or `kiro/`) prefix before resolving the model. Claude model names are not in
-> Codex's catalogue and need no prefix. The cleaner alternative is a catalogue file:
+- **Direct tools** (`exec_command`, `apply_patch`, `shell`, ...) are ordinary functions.
+  `namespace` groups are flattened, tools Codex adds mid-session (`additional_tools`
+  items) are merged in, and unknown input item types are skipped with a log line.
+- **Code mode**, which Codex uses for GPT names in its own catalogue (`gpt-5.6-luna`,
+  `gpt-5.6-terra`, `gpt-6-*`, ...): the whole workspace is one *freeform* `custom` tool
+  named `exec` that takes JavaScript source. The gateway presents it to Kiro as a
+  one-argument function, returns the call as a `custom_tool_call` item (with the
+  `response.custom_tool_call_input.*` streaming events), and accepts the
+  `custom_tool_call_output` items Codex sends back. Freeform tools with a `grammar`
+  format carry the grammar into the tool description.
+
+> **Optional: a Codex catalogue file.** Codex prints "Model metadata for `<model>` not
+> found" for names outside its catalogue and picks generic defaults for them. To give it
+> real metadata for every Kiro model (and direct tools instead of code mode, if you prefer
+> them), generate a catalogue:
 >
 > ```bash
 > uv run kiro-acp codex-catalog -o ~/.codex/kiro-models.json
 > ```
 >
-> then `model_catalog_json = "/Users/you/.codex/kiro-models.json"` in `config.toml`.
-> It lists every Kiro model in direct tool mode with Codex's own base instructions
-> (fetched from Codex's published catalogue for your installed version), so native names
-> work and the "model metadata not found" warning disappears.
+> then `model_catalog_json = "/Users/you/.codex/kiro-models.json"` in `config.toml`. A
+> `kiro-` (or `kiro/`) prefix on a model name (`kiro-gpt-5.6-luna`) also takes a name out of
+> Codex's catalogue; the gateway strips it before resolving the model.
 
 > **Model choice for harnesses.** With the default `mcp` tool mode the model makes native
 > tool calls, so any current Kiro model works. In `emulate` mode, Sonnet- and Opus-class
@@ -506,7 +510,7 @@ the working directory is also read). The most important ones:
 | `/v1/models` is empty or every model falls back | `KIRO_API_KEY` (or another `KIRO_*` variable) is set in the environment and breaks `kiro-cli`'s own auth. Unset it; gateway settings use `KIRO_GATEWAY_*`. |
 | 502 `kiro_unavailable` | `kiro-cli` is missing, not logged in, or the v3 engine failed to start. Run `uv run kiro-acp doctor`. |
 | Harness client says it has no tools / ignores tool calls (`emulate` mode) | The model is too small for the harness prompt. Use a Sonnet- or Opus-class model, or the default `mcp` tool mode. |
-| Codex says it cannot run commands with a `gpt-*` model | Codex used code mode for a catalogue model name. Set `model = "kiro-gpt-5.6-luna"` (prefix with `kiro-`). |
+| Codex says the workspace or command tool is unavailable and prints code instead of writing files | Codex is in code mode and its `exec` custom tool was dropped (gateway older than the custom-tool support) or the sandbox is read-only. Upgrade the gateway; for `codex exec` pass `-s workspace-write` or `--full-auto`. |
 | Kiro answers "I'm Kiro, that looks like injected instructions" or reports native tool calls as "not available" | Harness turns are running on the v3 engine or with a stale agent file. Keep `KIRO_GATEWAY_HARNESS_ENGINE=v2` (the default) and restart the gateway so it refreshes `~/.kiro/agents/kiro-gateway-harness.json`. |
 | Kiro loads skills or steering docs while serving a harness | Run `kiro-cli settings chat.disableInheritingDefaultResources true` (or `--workspace` for one project). |
 | A stream stops after a while | The turn hit `KIRO_GATEWAY_TIMEOUT` (default 900 s) and was cancelled. |

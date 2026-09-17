@@ -175,6 +175,21 @@ file for every Kiro model with `tool_mode: "direct"` and `use_responses_lite: fa
 Codex can use native names without the `kiro-` prefix and without the fallback-metadata
 warning. Document the `model_catalog_json = ...` config line.
 
+*Update (2026-09-17):* Codex code mode is now supported natively. OpenAI freeform
+`custom` tools (Codex's `exec` code runner) are modelled as one-argument functions and
+rendered back as `custom_tool_call` items on `/v1/responses` and `type: "custom"` tool
+calls on `/v1/chat/completions`, so catalogue GPT names work without the prefix or the
+catalogue file. Both remain useful for model metadata and for forcing direct tools.
+
+### 28. Serve the Codex model catalogue from the gateway — S
+Codex 0.154 fetches `GET <base_url>/models?client_version=<ver>` from every provider and
+expects the catalogue format (`{"models": [...]}` with `slug`, `tool_mode`, instructions);
+it logs a decode error against our OpenAI-style list and falls back to built-in metadata.
+Answer that exact request shape (the `client_version` query parameter identifies it) with
+the output of the `codex-catalog` generator so Codex gets metadata for every Kiro model
+with zero client configuration and no "model metadata not found" warning. Cache the
+upstream reference catalogue per Codex version and fall back gracefully offline.
+
 ### 25. Document and PDF inputs *(pattern)* — S
 Anthropic `document` blocks with base64 PDF sources and OpenAI `file` parts: extract text
 locally (`pypdf`, optional dependency) and attach it as a text block; keep the current

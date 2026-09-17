@@ -69,6 +69,8 @@ class ToolDef:
     name: str
     description: str = ""
     parameters: JSON = field(default_factory=lambda: {"type": "object", "properties": {}})
+    kind: str = "function"
+    """``function`` (JSON arguments) or ``custom`` (OpenAI freeform tool: one raw text input)."""
 
 
 @dataclass(slots=True)
@@ -147,7 +149,10 @@ class Conversation:
 
 
 def canonical_tool(tool: ToolDef) -> str:
-    return json.dumps({"n": tool.name, "d": tool.description, "p": tool.parameters}, sort_keys=True)
+    return json.dumps(
+        {"n": tool.name, "d": tool.description, "p": tool.parameters, "k": tool.kind},
+        sort_keys=True,
+    )
 
 
 def canonical_message(message: Message) -> JSON:
