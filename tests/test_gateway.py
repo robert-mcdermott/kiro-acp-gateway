@@ -27,10 +27,12 @@ def make_settings(workspace: Path, **overrides) -> Settings:
         workspace=str(workspace),
         api_key="secret",
         permissions="allow-once",
-        default_model="claude-haiku-4.5",
+        default_model="claude-opus-4.8",
         session_idle_ttl=30,
         harness_agent="kiro_planner",
+        harness_agent_mcp="kiro_planner",
         provision_harness_agent=False,
+        tool_mode="emulate",
     )
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)
@@ -88,15 +90,15 @@ async def test_models_openai_and_anthropic(client: httpx.AsyncClient) -> None:
     openai = (await client.get("/v1/models")).json()
     assert openai["object"] == "list"
     ids = [m["id"] for m in openai["data"]]
-    assert ids[:3] == ["claude-haiku-4.5", "claude-sonnet-4.6", "gpt-5.6-terra"]
-    assert {"claude-haiku-4-5", "claude-sonnet-4-6", "gpt-5-6-terra", "claude-auto", "auto"} <= set(
+    assert ids[:3] == ["claude-opus-4.8", "claude-sonnet-4.6", "gpt-5.6-terra"]
+    assert {"claude-opus-4-8", "claude-sonnet-4-6", "gpt-5-6-terra", "claude-auto", "auto"} <= set(
         ids
     )
     auto = await client.post(
         "/v1/chat/completions",
         json={"model": "claude-auto", "messages": [{"role": "user", "content": "who"}]},
     )
-    assert auto.json()["choices"][0]["message"]["content"].startswith("[claude-haiku-4.5]")
+    assert auto.json()["choices"][0]["message"]["content"].startswith("[claude-opus-4.8]")
     anthropic = (await client.get("/v1/models", headers={"anthropic-version": "2023-06-01"})).json()
     assert anthropic["data"][0]["type"] == "model"
     one = await client.get("/v1/models/claude-sonnet-4-6-20260101")
@@ -153,7 +155,7 @@ async def test_chat_unknown_model_falls_back(client: httpx.AsyncClient) -> None:
         json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "who"}]},
     )
     assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"].startswith("[claude-haiku-4.5]")
+    assert response.json()["choices"][0]["message"]["content"].startswith("[claude-opus-4.8]")
 
 
 async def test_chat_model_alias_normalization(client: httpx.AsyncClient) -> None:
@@ -851,6 +853,195 @@ async def test_warmup_loads_models(client: httpx.AsyncClient) -> None:
             break
         await asyncio.sleep(0.1)
     assert client.app.state.backend.health()["models_cached"] == 3  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- native MCP tool bridge
+
+
+@pytest.fixture
+async def mcp_client(workspace: Path, engine: str):
+    settings = make_settings(workspace, engine=engine, tool_mode="mcp", mcp_batch_window=0.3)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=60,
+        ) as http:
+            http.app = app  # type: ignore[attr-defined]
+            yield http
+
+
+READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "Read",
+        "description": "Read a file",
+        "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+    },
+}
+BASH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "Bash",
+        "description": "Run",
+        "parameters": {"type": "object", "properties": {"n": {"type": "integer"}}},
+    },
+}
+
+
+async def test_mcp_bridge_chat_roundtrip(mcp_client: httpx.AsyncClient) -> None:
+    first = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": 'mcp:Read:{"file_path": "notes.txt"}'}],
+            "tools": [READ_TOOL, BASH_TOOL],
+        },
+    )
+    assert first.status_code == 200, first.text
+    body = first.json()
+    message = body["choices"][0]["message"]
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    assert message["content"] == "Calling the tool."
+    call = message["tool_calls"][0]
+    assert call["function"]["name"] == "Read" and json.loads(call["function"]["arguments"]) == {
+        "file_path": "notes.txt"
+    }
+    assert body["kiro"]["tool_mode"] == "mcp" and body["kiro"]["agent"] == "kiro_planner"
+    # The Kiro turn is still open; deliver the result and get the continuation.
+    second = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": 'mcp:Read:{"file_path": "notes.txt"}'},
+                message,
+                {"role": "tool", "tool_call_id": call["id"], "content": "hello from notes"},
+            ],
+            "tools": [READ_TOOL, BASH_TOOL],
+        },
+    )
+    assert second.status_code == 200, second.text
+    body2 = second.json()
+    assert body2["choices"][0]["message"]["content"] == "result: hello from notes"
+    assert body2["choices"][0]["finish_reason"] == "stop"
+    assert body2["kiro"]["session_id"] == body["kiro"]["session_id"]
+    assert mcp_client.app.state.backend.health()["live_sessions"] == 1  # type: ignore[attr-defined]
+
+
+async def test_mcp_bridge_parallel_calls_streaming_anthropic(mcp_client: httpx.AsyncClient) -> None:
+    tools = [
+        {
+            "name": "Read",
+            "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}}},
+        },
+        {
+            "name": "Bash",
+            "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}}},
+        },
+    ]
+    first = await mcp_client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={
+            "model": "x",
+            "max_tokens": 100,
+            "stream": True,
+            "tools": tools,
+            "messages": [{"role": "user", "content": "mcp2"}],
+        },
+    )
+    events = sse_events(first.text)
+    starts = [e[1]["content_block"] for e in events if e[0] == "content_block_start"]
+    tool_uses = [b for b in starts if b["type"] == "tool_use"]
+    assert [b["name"] for b in tool_uses] == ["Read", "Bash"]
+    assert (
+        next(e[1] for e in events if e[0] == "message_delta")["delta"]["stop_reason"] == "tool_use"
+    )
+    assistant_content = [{"type": "text", "text": "Calling the tool."}] + [
+        {"type": "tool_use", "id": b["id"], "name": b["name"], "input": {"n": i + 1}}
+        for i, b in enumerate(tool_uses)
+    ]
+    results = [
+        {"type": "tool_result", "tool_use_id": b["id"], "content": f"out{i}"}
+        for i, b in enumerate(tool_uses)
+    ]
+    second = await mcp_client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={
+            "model": "x",
+            "max_tokens": 100,
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "mcp2"},
+                {"role": "assistant", "content": assistant_content},
+                {"role": "user", "content": results},
+            ],
+        },
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["content"][-1].get("text") == "results: out0 | out1", second.text
+    assert second.json()["stop_reason"] == "end_turn"
+
+
+async def test_mcp_bridge_abandoned_turn_is_cancelled_on_stop(
+    mcp_client: httpx.AsyncClient,
+) -> None:
+    first = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": 'mcp:Read:{"file_path": "a"}'}],
+            "tools": [READ_TOOL],
+        },
+    )
+    assert first.json()["choices"][0]["finish_reason"] == "tool_calls"
+    backend = mcp_client.app.state.backend  # type: ignore[attr-defined]
+    assert backend.health()["live_sessions"] == 1
+    await backend.stop()
+    assert backend.health()["live_sessions"] == 0
+
+
+async def test_mcp_bridge_large_tool_list(mcp_client: httpx.AsyncClient) -> None:
+    """Claude Code sends dozens of tools whose schemas exceed 64 KB in one message."""
+    big = "x" * 4000
+    tools = [READ_TOOL] + [
+        {
+            "type": "function",
+            "function": {
+                "name": f"Tool{i}",
+                "description": big,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"p": {"type": "string", "description": big}},
+                },
+            },
+        }
+        for i in range(30)
+    ]
+    first = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": 'mcp:Read:{"file_path": "big"}'}],
+            "tools": tools,
+        },
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+
+async def test_mcp_bridge_no_tools_uses_agent_mode(mcp_client: httpx.AsyncClient) -> None:
+    response = await mcp_client.post(
+        "/v1/chat/completions",
+        json={"model": "x", "messages": [{"role": "user", "content": "who"}]},
+    )
+    assert response.json()["kiro"].get("tool_mode") is None
+    assert response.json()["kiro"]["agent"] == "kiro_default"
 
 
 # --------------------------------------------------------------------------- legacy completions

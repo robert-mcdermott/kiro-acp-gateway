@@ -38,7 +38,7 @@ async def test_initialize_and_session_info(workspace: Path, engine: str) -> None
     async with make_agent(workspace, engine) as agent:
         assert agent.info.agent_info.name == "Fake ACP Agent"
         session = await agent.new_session()
-        assert session.model_id == "claude-haiku-4.5"
+        assert session.model_id == "claude-opus-4.8"
         assert "claude-sonnet-4.6" in session.info.model_ids
         assert session.mode_id == "kiro_default"
         assert session.info.mode_ids == ["kiro_default", "kiro_planner"]

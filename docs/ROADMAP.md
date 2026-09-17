@@ -72,7 +72,7 @@ Return a clean 501 with an explanatory message for `/v1/embeddings`, `/v1/audio/
 
 ## P3 — capability
 
-### 9. Native tool bridging over MCP — L
+### 9. Native tool bridging over MCP — L — DONE (default `tool_mode=mcp`)
 Replace prompt-based tool emulation with real tool calls: for each harness session the
 gateway registers a stdio MCP server (a small entry point in this package) via
 `session/new`'s `mcpServers`, exposing the client's tool schemas. When the model calls one,
@@ -189,7 +189,7 @@ to emit the unit for review. Pairs with the Dockerfile in #18.
 Record observed capabilities in `/v1/models` descriptions and in
 `docs/KIRO_ACP_NOTES.md`: which models emit thought chunks (their finding: opus yes,
 sonnet no on v2), which accept `/effort`, and which follow the emulated tool protocol
-reliably (Sonnet/Opus yes; GPT 5.6 previews mostly; Haiku no at harness prompt sizes).
+reliably in emulate mode (Sonnet/Opus yes; GPT 5.6 previews mostly).
 
 ### Already covered here (confirmed by the review)
 Embedded `role: "system"` messages inside Anthropic `messages` (Claude Code 2.1.215+) are

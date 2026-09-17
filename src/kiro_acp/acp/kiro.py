@@ -155,11 +155,15 @@ class KiroAgent:
         effort: str | None = None,
         autopilot: bool | None = None,
         timeout: float = 120.0,
+        _attempt: int = 0,
     ) -> Session:
         """Create a session and apply model/mode/effort/autopilot settings.
 
         Settings passed at launch (``KiroLaunchOptions.model`` etc.) already
         apply to the first session; explicit arguments here override them.
+        On the v3 engine a cold start can answer ``session/new`` before the
+        model catalogue is loaded; the session then waits for the
+        ``config_option_update`` and, failing that, is replaced by a fresh one.
         """
         session_cwd = os.path.abspath(cwd or self.cwd)
         result = await self.client.request(
@@ -173,6 +177,32 @@ class KiroAgent:
             self.client, SessionInfo.from_result(result), cwd=session_cwd, engine=self.engine
         )
         self.sessions[session.session_id] = session
+        if self.engine == "v3" and not session.info.model_ids:
+            ready = await session.wait_for(
+                lambda info: bool(info.model_ids), timeout=self.model_list_timeout
+            )
+            if not ready:
+                if _attempt < 2:
+                    LOG.info(
+                        "Session %s advertised no models; creating a fresh session",
+                        session.session_id,
+                    )
+                    await self.close_session(session, delete=True)
+                    return await self.new_session(
+                        cwd=cwd,
+                        mcp_servers=mcp_servers,
+                        model=model,
+                        mode=mode,
+                        effort=effort,
+                        autopilot=autopilot,
+                        timeout=timeout,
+                        _attempt=_attempt + 1,
+                    )
+                LOG.warning(
+                    "Session %s advertised no models within %.0fs",
+                    session.session_id,
+                    self.model_list_timeout,
+                )
         if self.engine == "v3":
             model = model or self.options.model
             mode = mode or self.options.agent

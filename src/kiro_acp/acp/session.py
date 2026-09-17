@@ -202,6 +202,8 @@ class Session:
         option = self.info.config_option("model", category="model")
         if option is not None:
             await self.set_config_option(option.id, model_id)
+        elif self.engine == "v3":
+            raise ACPError("The agent has not advertised a model option yet; cannot select a model")
         else:
             await self.client.request(
                 "session/set_model", {"sessionId": self.session_id, "modelId": model_id}

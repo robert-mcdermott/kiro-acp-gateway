@@ -139,9 +139,18 @@ class Settings(BaseSettings):
     )
 
     # --- translation ---------------------------------------------------------
-    tool_mode: Literal["emulate", "reject", "ignore"] = Field(
-        default="emulate",
-        description="How client-defined tools are handled: emulate via prompting, reject with 400, or ignore",
+    tool_mode: Literal["mcp", "emulate", "reject", "ignore"] = Field(
+        default="mcp",
+        description="How client-defined tools are handled: mcp (native calls via a bridged MCP server), "
+        "emulate (tagged-block prompting), reject with 400, or ignore",
+    )
+    harness_agent_mcp: str | None = Field(
+        default="kiro-gateway-harness-mcp",
+        description="Kiro agent used in mcp tool mode (tools: ['@harness']); provisioned alongside the tool-less agent",
+    )
+    mcp_batch_window: float = Field(
+        default=0.5,
+        description="Seconds to wait for additional parallel tool calls before answering the client",
     )
     tool_activity: Literal["none", "text", "thought"] = Field(
         default="thought",

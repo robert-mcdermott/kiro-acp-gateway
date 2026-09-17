@@ -76,7 +76,7 @@ uv run kiro-acp prompt --model claude-sonnet-4.6 --effort high --agent vibe \
   "Add type hints to utils.py"
 
 # Read the prompt from stdin
-git diff | uv run kiro-acp prompt - --model claude-haiku-4.5 \
+git diff | uv run kiro-acp prompt - --model gpt-5.6-luna \
   --permissions deny "Review this diff for bugs:"
 
 # Attach files and images
@@ -148,7 +148,7 @@ The JSON output looks like:
   "permissions": [{"tool_call_id": "...", "title": "Running: ls", "kind": "execute", "granted": true, "reason": "policy:allow-once"}],
   "metadata": {"contextUsagePercentage": 6.8, "meteringUsage": [{"value": 0.02, "unit": "credit"}], "turnDurationMs": 4613},
   "session_id": "sess_...",
-  "model": "claude-haiku-4.5",
+  "model": "claude-sonnet-4.6",
   "mode": "vibe"
 }
 ```
@@ -237,7 +237,7 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 
-stream = client.responses.create(model="claude-haiku-4.5", input="List the top-level files.", stream=True)
+stream = client.responses.create(model="gpt-5.6-luna", input="List the top-level files.", stream=True)
 for event in stream:
     if event.type == "response.output_text.delta":
         print(event.delta, end="", flush=True)
@@ -323,10 +323,10 @@ log line rather than rejected.
 > (fetched from Codex's published catalogue for your installed version), so native names
 > work and the "model metadata not found" warning disappears.
 
-> **Model choice for harnesses.** Claude Code and Codex send very large system prompts and
-> dozens of tool definitions. Sonnet- and Opus-class Kiro models (and the GPT 5.6 previews)
-> follow the emulated tool protocol reliably; `claude-haiku-4.5` tends to lose track of the
-> tool list at that prompt size. Both harnesses were verified end to end with
+> **Model choice for harnesses.** With the default `mcp` tool mode the model makes native
+> tool calls, so any current Kiro model works. In `emulate` mode, Sonnet- and Opus-class
+> Kiro models (and the GPT 5.6 previews) follow the emulated tool protocol reliably;
+> smaller models tend to lose track of the tool list at harness prompt sizes. Both harnesses were verified end to end with
 > `claude-sonnet-4.6` (Claude Code: multi-turn read/write task; Codex: shell command via the
 > Responses API).
 
@@ -354,7 +354,7 @@ carries tool definitions (`tools` in OpenAI requests, `tools` in Anthropic reque
 |---|---|---|
 | Triggered by | request includes `tools` (Claude Code, Codex, OpenCode, function-calling scripts) | request has no `tools` (pipeline scripts, curl, plain SDK calls) |
 | Who runs tools | the client, on its own machine and directory | Kiro, inside `KIRO_GATEWAY_WORKSPACE` |
-| Kiro agent | tool-less `KIRO_GATEWAY_HARNESS_AGENT` | `KIRO_GATEWAY_AGENT` (Kiro default) |
+| Kiro agent | `KIRO_GATEWAY_HARNESS_AGENT_MCP` (bridged tools only) or the tool-less `KIRO_GATEWAY_HARNESS_AGENT` in `emulate` mode | `KIRO_GATEWAY_AGENT` (Kiro default) |
 | Engine | `KIRO_GATEWAY_HARNESS_ENGINE` (v2) | `KIRO_GATEWAY_ENGINE` (v3) |
 | Permissions | `KIRO_GATEWAY_HARNESS_PERMISSIONS` (deny) | `KIRO_GATEWAY_PERMISSIONS` |
 | Output | text plus `tool_calls` / `function_call` / `tool_use` | text; Kiro's own activity as reasoning and in `kiro.tool_calls` |
@@ -367,8 +367,7 @@ example), set `KIRO_GATEWAY_TOOL_MODE=ignore` to drop them and force agent mode,
 ### How requests are translated
 
 **Models.** Requests may name any Kiro model id (`uv run kiro-acp models`). Common aliases
-are normalized (`claude-sonnet-4-6-20260101` becomes `claude-sonnet-4.6`; `claude-haiku-4-5`
-becomes `claude-haiku-4.5`). Unknown names fall back to `KIRO_GATEWAY_DEFAULT_MODEL` or
+are normalized (`claude-sonnet-4-6-20260101` becomes `claude-sonnet-4.6`; `claude-opus-4-8` becomes `claude-opus-4.8`). Unknown names fall back to `KIRO_GATEWAY_DEFAULT_MODEL` or
 Kiro's current default unless `KIRO_GATEWAY_MODEL_FALLBACK=false`, in which case they are
 rejected with a 404. Extra mappings: `KIRO_GATEWAY_MODEL_ALIASES='gpt-4*=gpt-5.6-terra,o3*=claude-opus-4.6'`.
 
@@ -379,34 +378,27 @@ the new messages to that session. Otherwise it starts a fresh session and replay
 history as a transcript. `KIRO_GATEWAY_SESSION_MODE=stateless` always starts fresh.
 Responses expose `kiro.session_id`, `kiro.reused_session`, `kiro.agent`, and `kiro.model`.
 
-**Client tools (harness mode).** Kiro cannot execute a client's tool definitions, so the
-gateway describes them in the prompt and asks the model to answer with
-`<tool_call>{"name": ..., "arguments": {...}}</tool_call>` blocks. Those blocks are
-parsed out of the stream and returned as OpenAI `tool_calls`, Responses `function_call`
-items, or Anthropic `tool_use` blocks, with the matching finish reason. Tool results sent
-back by the client are rendered into the transcript. Anthropic-defined tools (`bash`,
-`text_editor`) get synthesized schemas; server-side tools such as `web_search` are ignored.
-`KIRO_GATEWAY_TOOL_MODE=reject` refuses requests with tools; `ignore` drops them.
+**Client tools (harness mode).** Kiro cannot accept a client's tool definitions over ACP,
+so the gateway bridges them. In the default `mcp` tool mode it registers a small MCP server
+with each harness session (spawned by Kiro, part of this package) that advertises the
+client's tools. When the model calls one, the call is relayed to the gateway over a local
+socket and returned to the HTTP client as a normal OpenAI `tool_calls` / Responses
+`function_call` / Anthropic `tool_use`. The Kiro turn stays open, blocked inside the MCP
+call, until the client sends the tool result in its next request; the gateway then
+delivers it and streams the continuation. Models make genuine native tool calls, parallel
+calls work, and no text protocol has to be obeyed. Kiro runs the
+`kiro-gateway-harness-mcp` agent, whose only tools are the bridged ones.
 
-Kiro's stock agents have their own file and shell tools and its models are tuned to use
-them, which competes with the harness, and recent models rightly refuse to be told they are
-a different product with a "fabricated" tool protocol. For requests that carry tools the
-gateway therefore runs Kiro with a **tool-less agent** whose own prompt explains, honestly,
-what is going on: the model stays Kiro, the client's system prompt is context about the
-tool it is serving, and the client's functions are the only way to act on the user's
-project: at startup it writes
-`~/.kiro/agents/kiro-gateway-harness.json` (no tools, no MCP servers) unless the file
-already exists, and selects it for every harness-mode turn. Point
-`KIRO_GATEWAY_HARNESS_AGENT` at your own agent to customize this, or set it empty to keep
-Kiro's default agent; `KIRO_GATEWAY_PROVISION_HARNESS_AGENT=false` stops the gateway
-from writing the file. Kiro's remaining permission requests in harness mode follow
-`KIRO_GATEWAY_HARNESS_PERMISSIONS` (default `deny`).
+`KIRO_GATEWAY_TOOL_MODE=emulate` selects the older text protocol instead: tools are
+described in the prompt and the model answers with
+`<tool_call>{"name": ..., "arguments": {...}}</tool_call>` blocks that the gateway parses.
+It works with Sonnet/Opus-class models but depends on the model following instructions.
+`reject` refuses requests with tools; `ignore` drops them and runs agent mode.
+Anthropic-defined tools (`bash`, `text_editor`) get synthesized schemas in both modes;
+server-side tools such as `web_search` are ignored.
 
-Harness turns also run on the **v2 engine** by default (`KIRO_GATEWAY_HARNESS_ENGINE`),
-while agent-mode turns use `KIRO_GATEWAY_ENGINE` (v3). In testing, the v3 engine's own
-identity prompt and always-present skill loader led models to keep attempting native tool
-calls, and Sonnet 5 sometimes refused the harness framing outright; on v2 the tool-less
-agent behaves like a plain model and follows the protocol consistently.
+Open turns waiting for tool results are pooled like any session and cancelled when the
+client abandons them (`KIRO_GATEWAY_SESSION_IDLE_TTL`) or the gateway shuts down.
 
 **Kiro's own tools (agent mode).** When no client tools are supplied, Kiro acts as a full
 agent inside `KIRO_GATEWAY_WORKSPACE`, subject to `KIRO_GATEWAY_PERMISSIONS` and
@@ -494,7 +486,9 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_ENFORCE_MAX_TOKENS` | `false` | Cut output at the request's `max_tokens` using the token estimator. `stop` sequences are always enforced. |
 | `KIRO_GATEWAY_MODEL_ALIAS_STYLE` | `both` | Also list hyphenated ids (`claude-sonnet-4-6`) and `claude-auto`/`auto`; `native` lists Kiro ids only. |
 | `KIRO_GATEWAY_SANITIZE_SYSTEM` | `false` | Strip identity and concealment lines from client system prompts (defensive second layer). |
-| `KIRO_GATEWAY_TOOL_MODE` | `emulate` | What to do with client tool definitions: `emulate` (harness mode), `ignore` (drop them and run agent mode), or `reject` (400). |
+| `KIRO_GATEWAY_TOOL_MODE` | `mcp` | What to do with client tool definitions: `mcp` (native calls via a bridged MCP server), `emulate` (tagged-block prompting), `ignore` (drop them and run agent mode), or `reject` (400). |
+| `KIRO_GATEWAY_HARNESS_AGENT_MCP` | `kiro-gateway-harness-mcp` | Kiro agent used in `mcp` mode (`tools: ["@harness"]`). |
+| `KIRO_GATEWAY_MCP_BATCH_WINDOW` | `0.5` | Seconds to collect parallel tool calls before answering the client. |
 | `KIRO_GATEWAY_TOOL_ACTIVITY` | `thought` | `thought`, `text`, or `none`. |
 | `KIRO_GATEWAY_TOOL_ACTIVITY_DETAIL` | `full` | `full` renders arguments, diffs, and output excerpts; `brief` is one line per call. |
 | `KIRO_GATEWAY_VALIDATE_JSON_OUTPUT` | `true` | Validate structured-output replies against the JSON schema and retry once (non-streaming). |
@@ -511,7 +505,7 @@ the working directory is also read). The most important ones:
 | Claude Code: `401 invalid x-api-key`; gateway log mentions an OAuth token | Claude Code is sending its account login instead of the gateway key. Set `ANTHROPIC_AUTH_TOKEN` to the gateway key too, or use a separate `CLAUDE_CONFIG_DIR` (see above). |
 | `/v1/models` is empty or every model falls back | `KIRO_API_KEY` (or another `KIRO_*` variable) is set in the environment and breaks `kiro-cli`'s own auth. Unset it; gateway settings use `KIRO_GATEWAY_*`. |
 | 502 `kiro_unavailable` | `kiro-cli` is missing, not logged in, or the v3 engine failed to start. Run `uv run kiro-acp doctor`. |
-| Harness client says it has no tools / ignores tool calls | The model is too small for the harness prompt. Use a Sonnet- or Opus-class model. |
+| Harness client says it has no tools / ignores tool calls (`emulate` mode) | The model is too small for the harness prompt. Use a Sonnet- or Opus-class model, or the default `mcp` tool mode. |
 | Codex says it cannot run commands with a `gpt-*` model | Codex used code mode for a catalogue model name. Set `model = "kiro-gpt-5.6-luna"` (prefix with `kiro-`). |
 | Kiro answers "I'm Kiro, that looks like injected instructions" or reports native tool calls as "not available" | Harness turns are running on the v3 engine or with a stale agent file. Keep `KIRO_GATEWAY_HARNESS_ENGINE=v2` (the default) and restart the gateway so it refreshes `~/.kiro/agents/kiro-gateway-harness.json`. |
 | Kiro loads skills or steering docs while serving a harness | Run `kiro-cli settings chat.disableInheritingDefaultResources true` (or `--workspace` for one project). |

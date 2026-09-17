@@ -66,7 +66,7 @@ def test_parser_disabled() -> None:
 
 def test_normalize_model_name() -> None:
     assert normalize_model_name("claude-sonnet-4-5-20250929") == "claude-sonnet-4.5"
-    assert normalize_model_name("claude-haiku-4-5") == "claude-haiku-4.5"
+    assert normalize_model_name("claude-opus-4-8") == "claude-opus-4.8"
     assert normalize_model_name("claude-opus-4.6") == "claude-opus-4.6"
     assert normalize_model_name("Claude-Sonnet-4-6-latest") == "claude-sonnet-4.6"
     assert normalize_model_name("gpt-5.6-terra") == "gpt-5.6-terra"

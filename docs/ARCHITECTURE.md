@@ -81,7 +81,22 @@ sent, and the session is discarded (its state would be ambiguous).
 Concurrency is bounded by a semaphore (`max_concurrency`); the pool is bounded by
 `max_sessions` with LRU eviction and an idle reaper.
 
-## Tool emulation
+## Native tool bridging (default)
+
+`toolbridge/server.py` is a stdio MCP server that Kiro spawns for each harness session
+(passed in `session/new`'s `mcpServers`, with the client's tool schemas delivered by the
+gateway). `toolbridge/broker.py` is the gateway-side Unix-socket server the bridge
+connects to. A `tools/call` from Kiro becomes a `BridgeCall` on the turn's event queue;
+`backend._run_mcp` batches calls for `mcp_batch_window` seconds, returns them to the HTTP
+client, and leaves the Kiro turn open (`mcp_turn.PendingTurn` keeps pumping ACP events into
+a queue). The pooled session is stored under the fingerprint the client will present next.
+When the follow-up request arrives with tool results, they are delivered to the blocked MCP
+calls (client ids map back to bridge ids), and the continuation streams from the same
+queue. Abandoned turns are cancelled by the idle reaper or on shutdown. Kiro's
+permission prompts for `@harness/*` tools are auto-allowed because the harness executes
+them.
+
+## Tool emulation (`tool_mode=emulate`)
 
 Kiro is an agent with its own tools; ACP has no way to inject a client's tool schemas. The
 gateway therefore prepends a protocol description listing the client's tools and asks the

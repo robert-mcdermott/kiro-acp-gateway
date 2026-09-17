@@ -15,7 +15,7 @@ from tests.conftest import integration_enabled
 
 pytestmark = pytest.mark.integration
 
-MODEL = "claude-haiku-4.5"
+MODEL = "gpt-5.6-luna"
 
 if not integration_enabled() or shutil.which("kiro-cli") is None:
     pytest.skip("set KIRO_INTEGRATION=1 with kiro-cli installed", allow_module_level=True)
@@ -77,7 +77,7 @@ async def test_gateway_chat_and_messages(workspace: Path) -> None:
             "/v1/messages",
             headers={"anthropic-version": "2023-06-01"},
             json={
-                "model": "claude-haiku-4-5",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
             },

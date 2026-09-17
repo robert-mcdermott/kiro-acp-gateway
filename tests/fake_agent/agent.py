@@ -27,7 +27,7 @@ from typing import Any
 
 JSON = dict[str, Any]
 ENGINE = os.environ.get("FAKE_ACP_ENGINE", "v2")
-MODELS = ["claude-haiku-4.5", "claude-sonnet-4.6", "gpt-5.6-terra"]
+MODELS = ["claude-opus-4.8", "claude-sonnet-4.6", "gpt-5.6-terra"]
 MODES = ["kiro_default", "kiro_planner"]
 
 
@@ -114,6 +114,7 @@ class Agent:
                 "model": MODELS[0],
                 "mode": MODES[0],
                 "autopilot": "on",
+                "mcp": params.get("mcpServers") or [],
             }
             return self.session_result(session_id)
         if method == "session/load":
@@ -270,6 +271,47 @@ class Agent:
                 await say(f"Effort set to {level}\n")
             else:
                 await say(f"invalid value '{level}' for 'output_config.effort'\n")
+            return {"stopReason": "end_turn"}
+        if text.startswith("mcp:") or text == "mcp2":
+            mcp_config = session.get("mcp") or []
+            if not mcp_config:
+                await say("no mcp servers configured")
+                return {"stopReason": "end_turn"}
+            client = session.get("mcp_client")
+            if client is None:
+                client = McpClient(mcp_config[0])
+                await client.start()
+                session["mcp_client"] = client
+            await say("Calling the tool. ")
+            if text == "mcp2":
+                names = [t["name"] for t in client.tools][:2]
+                await self.update(
+                    session_id,
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "h1",
+                        "title": f"Running: @harness/{names[0]}",
+                        "kind": "other",
+                    },
+                )
+                results = await asyncio.gather(
+                    client.call(names[0], {"n": 1}), client.call(names[1], {"n": 2})
+                )
+                await say("results: " + " | ".join(results))
+            else:
+                _, name, raw_args = text.split(":", 2)
+                await self.update(
+                    session_id,
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "h1",
+                        "title": f"Running: @harness/{name}",
+                        "kind": "other",
+                    },
+                )
+                result = await client.call(name, json.loads(raw_args))
+                await say("result: " + result)
+            await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 5})
             return {"stopReason": "end_turn"}
         if text == "badjson":
             await say("not json at all")
@@ -443,6 +485,76 @@ class Agent:
             },
         )
         return {"stopReason": "end_turn"}
+
+
+class McpClient:
+    """Minimal MCP stdio client so the fake agent can exercise the gateway's tool bridge."""
+
+    def __init__(self, config: JSON) -> None:
+        self.config = config
+        self.process: asyncio.subprocess.Process | None = None
+        self.next_id = 0
+        self.pending: dict[int, asyncio.Future[JSON]] = {}
+        self.tools: list[JSON] = []
+
+    async def start(self) -> None:
+        env = dict(os.environ)
+        for item in self.config.get("env") or []:
+            env[item["name"]] = item["value"]
+        self.process = await asyncio.create_subprocess_exec(
+            self.config["command"],
+            *self.config.get("args", []),
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=64 * 1024 * 1024,
+        )
+        asyncio.create_task(self._reader())
+        await self.request(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "fake", "version": "0"},
+            },
+        )
+        result = await self.request("tools/list", {})
+        self.tools = result.get("tools", [])
+
+    async def _reader(self) -> None:
+        assert self.process and self.process.stdout
+        while line := await self.process.stdout.readline():
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            future = self.pending.pop(message.get("id"), None)
+            if future is not None and not future.done():
+                future.set_result(message.get("result") or {"error": message.get("error")})
+
+    async def request(self, method: str, params: JSON) -> JSON:
+        assert self.process and self.process.stdin
+        self.next_id += 1
+        future: asyncio.Future[JSON] = asyncio.get_running_loop().create_future()
+        self.pending[self.next_id] = future
+        self.process.stdin.write(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params}
+            ).encode()
+            + b"\n"
+        )
+        await self.process.stdin.drain()
+        return await future
+
+    async def call(self, name: str, arguments: JSON) -> str:
+        result = await self.request("tools/call", {"name": name, "arguments": arguments})
+        return "".join(c.get("text", "") for c in result.get("content", []) if isinstance(c, dict))
+
+    async def close(self) -> None:
+        if self.process and self.process.returncode is None:
+            self.process.kill()
+            await self.process.wait()
 
 
 class RpcError(Exception):

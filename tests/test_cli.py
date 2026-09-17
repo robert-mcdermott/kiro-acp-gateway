@@ -103,7 +103,7 @@ def test_models_and_agents(workspace: Path) -> None:
     proc = run_cli("models", "--json", cwd=workspace)
     assert proc.returncode == 0, proc.stderr
     assert [m["modelId"] for m in json.loads(proc.stdout)["models"]] == [
-        "claude-haiku-4.5",
+        "claude-opus-4.8",
         "claude-sonnet-4.6",
         "gpt-5.6-terra",
     ]

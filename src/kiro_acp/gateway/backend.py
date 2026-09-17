@@ -35,11 +35,13 @@ from kiro_acp.acp.session import normalize_effort
 from kiro_acp.acp.types import ModelInfo
 from kiro_acp.gateway.activity import render_completed, render_plan, render_started
 from kiro_acp.gateway.config import Settings
-from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart
+from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart, ToolDef
 from kiro_acp.gateway.harness_agent import ensure_harness_agent
 from kiro_acp.gateway.limits import StreamLimiter
+from kiro_acp.gateway.mcp_turn import END, BridgeCall, PendingTurn
 from kiro_acp.gateway.prompting import assistant_message, render_prompt
 from kiro_acp.gateway.structured import strip_json_fences, validate_json_reply
+from kiro_acp.gateway.toolbridge.broker import BridgeSession, ToolBridgeBroker
 from kiro_acp.gateway.toolcalls import ToolCallParser
 from kiro_acp.gateway.turn import (
     OutputDone,
@@ -141,12 +143,19 @@ class PooledSession:
     effort: str | None
     permissions: str
     workspace: str = ""
+    bridge: BridgeSession | None = None
+    pending: PendingTurn | None = None
+    tools_signature: str = ""
     fingerprint: str | None = None
     last_used: float = field(default_factory=time.monotonic)
     busy: bool = False
     created: float = field(default_factory=time.monotonic)
 
     async def close(self, *, delete: bool = False) -> None:
+        if self.pending is not None:
+            with contextlib.suppress(Exception):
+                await self.pending.cancel("session closed")
+            self.pending = None
         if delete:
             with contextlib.suppress(Exception):
                 await self.agent.close_session(self.session, delete=True)
@@ -169,18 +178,26 @@ class KiroBackend:
         self._reaper: asyncio.Task[None] | None = None
         self._warmup: asyncio.Task[None] | None = None
         self._active: set[PooledSession] = set()
+        self.bridge_broker: ToolBridgeBroker | None = None
         self.started = False
 
     # ------------------------------------------------------------------ lifecycle
 
     async def start(self) -> None:
-        if self.settings.harness_agent and self.settings.provision_harness_agent:
-            try:
-                ensure_harness_agent(self.settings.harness_agent)
-            except OSError as error:
-                LOG.warning(
-                    "Could not provision harness agent %r: %s", self.settings.harness_agent, error
-                )
+        if self.settings.provision_harness_agent:
+            for name, mcp in (
+                (self.settings.harness_agent, False),
+                (self.settings.harness_agent_mcp, True),
+            ):
+                if not name:
+                    continue
+                try:
+                    ensure_harness_agent(name, mcp=mcp)
+                except OSError as error:
+                    LOG.warning("Could not provision harness agent %r: %s", name, error)
+        if self.settings.tool_mode == "mcp":
+            self.bridge_broker = ToolBridgeBroker()
+            await self.bridge_broker.start()
         self.started = True
         self._reaper = asyncio.create_task(self._reap_idle(), name="kiro-session-reaper")
         if self.settings.warmup:
@@ -225,6 +242,9 @@ class KiroBackend:
         await asyncio.gather(
             *(p.close(delete=self.settings.delete_sessions) for p in pooled), return_exceptions=True
         )
+        if self.bridge_broker is not None:
+            await self.bridge_broker.stop()
+            self.bridge_broker = None
 
     async def _reap_idle(self) -> None:
         while True:
@@ -307,9 +327,16 @@ class KiroBackend:
 
     # ------------------------------------------------------------------ agents
 
-    def _handlers(self, permissions: str, workspace: str | None = None) -> ClientHandlers:
+    def _handlers(
+        self,
+        permissions: str,
+        workspace: str | None = None,
+        extra_rules: list[PermissionRule] | None = None,
+    ) -> ClientHandlers:
         root = workspace or self.settings.workspace
-        rules = [PermissionRule.parse(rule) for rule in self.settings.permission_rules]
+        rules = list(extra_rules or []) + [
+            PermissionRule.parse(rule) for rule in self.settings.permission_rules
+        ]
         return ClientHandlers(
             permissions=PermissionPolicy(permissions, rules=rules),
             filesystem=LocalFileSystem(root) if self.settings.serve_fs else None,
@@ -325,6 +352,7 @@ class KiroBackend:
         effort: str | None = None,
         engine: str | None = None,
         workspace: str | None = None,
+        extra_rules: list[PermissionRule] | None = None,
     ) -> KiroAgent:
         options = KiroLaunchOptions(
             executable=self.settings.cli,
@@ -339,7 +367,7 @@ class KiroBackend:
         return KiroAgent(
             options,
             cwd=cwd,
-            handlers=self._handlers(permissions, cwd),
+            handlers=self._handlers(permissions, cwd, extra_rules),
             client_name="kiro-gateway",
             client_version=__version__,
             request_timeout=120.0,
@@ -350,8 +378,28 @@ class KiroBackend:
             return self.settings.harness_engine
         return self.settings.engine
 
-    async def _spawn(self, opts: TurnOptions, permissions: str) -> PooledSession:
+    async def _spawn(
+        self, opts: TurnOptions, permissions: str, tools: list[ToolDef] | None = None
+    ) -> PooledSession:
         engine = self.engine_for(opts)
+        use_bridge = (
+            bool(tools)
+            and opts.emulate_tools
+            and self.settings.tool_mode == "mcp"
+            and self.bridge_broker is not None
+        )
+        bridge: BridgeSession | None = None
+        mcp_servers: list[JSON] = []
+        extra_rules: list[PermissionRule] = []
+        if use_bridge:
+            assert self.bridge_broker is not None and tools is not None
+            bridge = self.bridge_broker.register([mcp_tool(t) for t in tools])
+            mcp_servers = [self.bridge_broker.mcp_server_config(bridge)]
+            # The bridged tools are executed by the harness, so let Kiro call them freely.
+            extra_rules = [
+                PermissionRule.parse("allow:title=*@harness/*"),
+                PermissionRule.parse("allow:tool=@harness/*"),
+            ]
         agent = self._make_agent(
             permissions=permissions,
             model=opts.model,
@@ -359,6 +407,7 @@ class KiroBackend:
             effort=opts.effort,
             engine=engine,
             workspace=opts.workspace,
+            extra_rules=extra_rules,
         )
         try:
             await agent.start()
@@ -366,18 +415,21 @@ class KiroBackend:
                 model=opts.model,
                 mode=opts.agent,
                 effort=opts.effort,
+                mcp_servers=mcp_servers,
                 autopilot=(permissions == "allow-all") if engine == "v3" else None,
             )
         except ACPRemoteError as error:
             await agent.close()
-            raise GatewayError(
-                str(error), status=400 if "Unknown" in str(error) else 502, code="kiro_error"
-            ) from error
+            if bridge is not None:
+                self.bridge_broker.unregister(bridge)
+            if "Unknown" in str(error):
+                raise GatewayError(str(error), status=400, code="kiro_error") from error
+            raise GatewayError.from_kiro(str(error)) from error
         except ACPError as error:
             await agent.close()
-            raise GatewayError(
-                str(error), status=502, error_type="api_error", code="kiro_unavailable"
-            ) from error
+            if bridge is not None:
+                self.bridge_broker.unregister(bridge)
+            raise GatewayError.from_kiro(str(error)) from error
         return PooledSession(
             agent=agent,
             session=session,
@@ -386,13 +438,21 @@ class KiroBackend:
             effort=opts.effort,
             permissions=permissions,
             workspace=opts.workspace or self.settings.workspace,
+            bridge=bridge,
+            tools_signature=tools_signature(tools) if use_bridge else "",
         )
 
-    # ------------------------------------------------------------------ session selection
+    # ---------------------------------------------------------------- session selection
 
     async def _acquire(
         self, conversation: Conversation, opts: TurnOptions, permissions: str
     ) -> tuple[PooledSession, int, bool]:
+        """Return ``(pooled, start_index, fresh)``."""
+        signature = (
+            tools_signature(conversation.tools)
+            if opts.emulate_tools and self.settings.tool_mode == "mcp"
+            else ""
+        )
         """Return ``(pooled, start_index, fresh)``."""
         if self.settings.session_mode == "affinity":
             start = conversation.prefix_length_for_affinity()
@@ -408,6 +468,7 @@ class KiroBackend:
                         and pooled.permissions == permissions
                         and pooled.agent.engine == self.engine_for(opts)
                         and pooled.workspace == (opts.workspace or self.settings.workspace)
+                        and pooled.tools_signature == signature
                         and (opts.effort is None or pooled.effort == opts.effort)
                         and pooled.agent.client.is_running
                     ):
@@ -417,7 +478,7 @@ class KiroBackend:
                             "Reusing session %s for prefix %s", pooled.session.session_id, key[:12]
                         )
                         return pooled, start, False
-        pooled = await self._spawn(opts, permissions)
+        pooled = await self._spawn(opts, permissions, conversation.tools if signature else None)
         pooled.busy = True
         return pooled, 0, True
 
@@ -426,6 +487,8 @@ class KiroBackend:
         pooled.last_used = time.monotonic()
         if not keep or fingerprint is None or self.settings.session_mode != "affinity":
             await pooled.close(delete=self.settings.delete_sessions)
+            if pooled.bridge is not None and self.bridge_broker is not None:
+                self.bridge_broker.unregister(pooled.bridge)
             return
         pooled.fingerprint = fingerprint
         evicted: list[PooledSession] = []
@@ -490,7 +553,14 @@ class KiroBackend:
                 )
             opts.workspace = candidate
         if opts.agent is None:
-            opts.agent = self.settings.harness_agent if opts.emulate_tools else self.settings.agent
+            if opts.emulate_tools:
+                opts.agent = (
+                    self.settings.harness_agent_mcp
+                    if self.settings.tool_mode == "mcp" and self.bridge_broker is not None
+                    else self.settings.harness_agent
+                )
+            else:
+                opts.agent = self.settings.agent
         try:
             await asyncio.wait_for(
                 self._turn_slots.acquire(),
@@ -507,6 +577,17 @@ class KiroBackend:
         try:
             pooled, start, fresh = await self._acquire(conversation, opts, permissions)
             self._active.add(pooled)
+            if (
+                opts.emulate_tools
+                and self.settings.tool_mode == "mcp"
+                and pooled.bridge is not None
+            ):
+                async with contextlib.aclosing(
+                    self._run_mcp(conversation, opts, pooled, start, fresh)
+                ) as mcp_events:
+                    async for event in mcp_events:
+                        yield event
+                return
             session = pooled.session
             LOG.info(
                 "turn %s: %s engine=%s agent=%s model=%s permissions=%s session=%s%s",
@@ -700,6 +781,180 @@ class KiroBackend:
         finally:
             self._turn_slots.release()
 
+    async def _run_mcp(
+        self,
+        conversation: Conversation,
+        opts: TurnOptions,
+        pooled: PooledSession,
+        start: int,
+        fresh: bool,
+    ) -> AsyncIterator[OutputEvent]:
+        """Harness turn with native tool calls through the MCP bridge."""
+        session = pooled.session
+        assert pooled.bridge is not None
+        kiro_meta: JSON = {
+            "session_id": session.session_id,
+            "engine": pooled.agent.engine,
+            "reused_session": not fresh,
+            "agent": session.mode_id,
+            "model": session.model_id,
+            "workspace": pooled.workspace,
+            "tool_mode": "mcp",
+        }
+        LOG.info(
+            "turn %s: harness(mcp) engine=%s agent=%s model=%s session=%s%s",
+            opts.request_id,
+            pooled.agent.engine,
+            session.mode_id,
+            session.model_id,
+            session.session_id,
+            " (continuing pending turn)"
+            if pooled.pending is not None
+            else (" (reused)" if not fresh else ""),
+        )
+        pending = pooled.pending
+        new_messages = conversation.messages[start:]
+        if pending is not None:
+            # Continuation: hand the client's tool results to the blocked MCP calls.
+            results = [r for m in new_messages for r in m.tool_results]
+            extra_text = "\n\n".join(
+                m.text().strip() for m in new_messages if m.role == "user" and m.text().strip()
+            )
+            delivered = 0
+            for result in results:
+                content = result.content
+                if extra_text and result is results[-1]:
+                    content += f"\n\n[User message]: {extra_text}"
+                if await pending.deliver(result.call_id, content, is_error=result.is_error):
+                    delivered += 1
+                else:
+                    LOG.warning(
+                        "Turn %s: result for unknown call id %s", opts.request_id, result.call_id
+                    )
+            if pending.awaiting and not delivered:
+                # The client sent something else while calls were outstanding: give up on them.
+                for call_id in list(pending.awaiting):
+                    await pending.deliver(
+                        call_id, "No result was provided for this tool call.", is_error=True
+                    )
+        else:
+            blocks = render_prompt(
+                conversation,
+                start=start,
+                include_system=fresh,
+                emulate_tools=False,
+                sanitize=self.settings.sanitize_system,
+            )
+            pending = PendingTurn(session=session, bridge=pooled.bridge)
+            pending.start(blocks, timeout=0)
+            pooled.pending = pending
+        text_parts: list[str] = []
+        thought_parts: list[str] = []
+        calls: list[ToolCallPart] = []
+        pending_calls: list[BridgeCall] = []
+        finish = "stop"
+        error: str | None = None
+        completed = False
+        keep = False
+        fingerprint: str | None = None
+        try:
+            batch_deadline: float | None = None
+            while True:
+                timeout = None
+                if batch_deadline is not None:
+                    timeout = max(batch_deadline - time.monotonic(), 0.0)
+                elif self.settings.timeout > 0:
+                    timeout = self.settings.timeout
+                try:
+                    item = await pending.next_event(timeout)
+                except TimeoutError:
+                    if batch_deadline is not None:
+                        break  # batch window closed
+                    error = f"Kiro produced no output for {self.settings.timeout:g}s"
+                    finish = "error"
+                    await pending.cancel("timeout")
+                    break
+                if item is END:
+                    completed = True
+                    break
+                if isinstance(item, Exception):
+                    finish, error = "error", str(item)
+                    completed = True
+                    break
+                if isinstance(item, BridgeCall):
+                    pending_calls.append(item)
+                    if batch_deadline is None:
+                        batch_deadline = time.monotonic() + self.settings.mcp_batch_window
+                    continue
+                match item:
+                    case TextDelta(text=chunk):
+                        # With native calls the model is blocked until results return, so any
+                        # text seen now was produced before the call; keep it.
+                        text_parts.append(chunk)
+                        yield OutputText(chunk)
+                    case ThoughtDelta(text=chunk):
+                        if self.settings.expose_thoughts:
+                            thought_parts.append(chunk)
+                            yield OutputThought(chunk)
+                    case ToolCallEvent(call=call, phase=phase):
+                        if "@harness/" in (call.title or "") or (call.tool_name or "").startswith(
+                            "@harness"
+                        ):
+                            continue
+                        if phase in ("started", "completed"):
+                            kiro_meta.setdefault("tool_calls", []).append(call.to_dict())
+                    case MetadataUpdate(data=data):
+                        merge_metadata(kiro_meta, data)
+                    case TurnComplete(stop_reason=stop, error=turn_error):
+                        finish, error = map_stop(stop, turn_error, False)
+                        completed = True
+                        break
+                    case _:
+                        pass
+            for bridge_call in pending_calls:
+                part = ToolCallPart(
+                    id=f"call_{bridge_call.call_id}",
+                    name=bridge_call.name,
+                    arguments=bridge_call.arguments,
+                )
+                pending.register_call(part.id, bridge_call.call_id, part)
+                calls.append(part)
+                yield OutputToolCall(part)
+            if calls:
+                finish = "tool_calls"
+            text = "".join(text_parts).rstrip() if calls else "".join(text_parts)
+            thoughts = "".join(thought_parts)
+            usage = self._usage(conversation, text, thoughts, calls)
+            if completed:
+                pooled.pending = None
+                keep = error is None
+            else:
+                keep = True  # turn still open, waiting for tool results
+            fingerprint = None
+            if keep and finish in ("stop", "tool_calls"):
+                fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
+            yield OutputDone(
+                finish=finish,
+                text=text,
+                thoughts=thoughts,
+                tool_calls=calls,
+                usage=usage,
+                kiro=kiro_meta,
+                error=error,
+                session_id=session.session_id,
+            )
+            if not keep:
+                pooled.pending = None
+        finally:
+            if pooled.pending is not None and not keep:
+                await pooled.pending.cancel("request ended")
+                pooled.pending = None
+            if not completed and not keep:
+                await self._release(pooled, None, keep=False)
+            else:
+                await self._release(pooled, fingerprint if keep else None, keep=keep)
+            self._active.discard(pooled)
+
     async def _retry_json(
         self, session: Session, text: str, errors: list[str], conversation: Conversation
     ) -> tuple[str, bool, list[str]]:
@@ -766,6 +1021,25 @@ class KiroBackend:
         }
 
 
+def mcp_tool(tool: ToolDef) -> JSON:
+    return {
+        "name": tool.name,
+        "description": tool.description or tool.name,
+        "inputSchema": tool.parameters or {"type": "object", "properties": {}},
+    }
+
+
+def tools_signature(tools: list[ToolDef] | None) -> str:
+    import hashlib
+
+    if not tools:
+        return ""
+    payload = json.dumps(
+        sorted((t.name, t.description, json.dumps(t.parameters, sort_keys=True)) for t in tools)
+    )
+    return hashlib.sha1(payload.encode()).hexdigest()
+
+
 def map_stop(stop: StopReason, error: str | None, has_calls: bool) -> tuple[str, str | None]:
     if error or stop == StopReason.ERROR:
         return "error", error or "Kiro turn failed"
@@ -791,7 +1065,7 @@ def merge_metadata(target: JSON, data: JSON) -> None:
 
 
 def normalize_model_name(name: str) -> str:
-    """``claude-sonnet-4-5-20250929`` -> ``claude-sonnet-4.5``; ``claude-3-5-haiku-latest`` -> ``claude-3.5-haiku``."""
+    """``claude-sonnet-4-5-20250929`` -> ``claude-sonnet-4.5``; ``claude-opus-4-8-latest`` -> ``claude-opus-4.8``."""
     import re
 
     value = name.strip().lower()
