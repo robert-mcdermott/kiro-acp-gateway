@@ -23,6 +23,7 @@ from kiro_acp.acp.errors import (
     ACPTimeoutError,
 )
 from kiro_acp.acp.handlers import ClientHandlers
+from kiro_acp.acp.recorder import FrameRecorder
 from kiro_acp.acp.types import (
     JSON,
     PROTOCOL_VERSION,
@@ -61,7 +62,9 @@ class ACPClient:
         client_name: str = "kiro-acp",
         client_version: str = "0.1.0",
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        recorder: FrameRecorder | None = None,
     ) -> None:
+        self.recorder = recorder
         self.command = [str(part) for part in command]
         self.cwd = os.path.abspath(cwd) if cwd else None
         self.env = dict(env) if env is not None else None
@@ -154,6 +157,8 @@ class ACPClient:
             return
         with contextlib.suppress(Exception):
             await self.handlers.close()
+        if self.recorder is not None:
+            self.recorder.close()
         if process.stdin is not None and not process.stdin.is_closing():
             process.stdin.close()
             with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
@@ -331,6 +336,8 @@ class ACPClient:
                     continue
                 if WIRE.isEnabledFor(logging.DEBUG):
                     WIRE.debug("<-- %s", stripped.decode("utf-8", "replace"))
+                if self.recorder is not None:
+                    self.recorder.record("in", raw)
                 self._route(jsonrpc.parse(raw))
         finally:
             error = self._process_error("agent stdout closed")
@@ -451,6 +458,8 @@ class ACPClient:
         data = jsonrpc.encode(message)
         if WIRE.isEnabledFor(logging.DEBUG):
             WIRE.debug("--> %s", data.decode("utf-8", "replace").rstrip())
+        if self.recorder is not None:
+            self.recorder.record("out", message)
         async with self._write_lock:
             try:
                 process.stdin.write(data)

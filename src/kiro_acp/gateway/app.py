@@ -156,6 +156,24 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
     async def health():
         return backend.health()
 
+    if settings.audit_records > 0:
+
+        @app.get("/v1/kiro/sessions", dependencies=[Depends(authorize)])
+        async def audit_sessions():
+            return {"object": "list", "data": backend.audit.sessions()}
+
+        @app.get("/v1/kiro/sessions/{session_id}/audit", dependencies=[Depends(authorize)])
+        async def audit_session(session_id: str):
+            data = backend.audit.session(session_id)
+            if data is None:
+                raise GatewayError(
+                    "No audit records for that session",
+                    status=404,
+                    error_type="not_found_error",
+                    code="session_not_found",
+                )
+            return data
+
     if settings.metrics:
 
         @app.get("/metrics", dependencies=[Depends(authorize)])

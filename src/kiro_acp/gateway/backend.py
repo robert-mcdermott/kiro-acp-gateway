@@ -25,6 +25,7 @@ from kiro_acp.acp import (
     LocalFileSystem,
     LocalTerminals,
     MetadataUpdate,
+    PermissionDecision,
     PermissionPolicy,
     PermissionRule,
     PlanUpdate,
@@ -35,9 +36,10 @@ from kiro_acp.acp import (
     ToolCallEvent,
     TurnComplete,
 )
-from kiro_acp.acp.session import normalize_effort
+from kiro_acp.acp.session import normalize_effort, text_block
 from kiro_acp.acp.types import ModelInfo
 from kiro_acp.gateway.activity import render_completed, render_plan, render_started
+from kiro_acp.gateway.audit import AuditLedger
 from kiro_acp.gateway.codex import CodexCatalogCache
 from kiro_acp.gateway.config import Settings
 from kiro_acp.gateway.conversation import JSON, Conversation, ToolCallPart, ToolDef
@@ -102,6 +104,7 @@ class GatewayError(Exception):
 # Ordered: the first matching pattern wins, so specific classes precede generic ones.
 # (pattern, HTTP status, API error type, code, Retry-After seconds)
 _ERROR_RULES: list[tuple[re.Pattern[str], int, str, str, int | None]] = [
+    (re.compile(r"stalled for"), 504, "api_error", "kiro_stall", None),
     (re.compile(r"already in progress"), 409, "invalid_request_error", "session_busy", 2),
     (re.compile(r"invalid model id"), 400, "invalid_request_error", "invalid_model", None),
     (
@@ -270,6 +273,7 @@ class KiroBackend:
         self._harness_dir: str | None = None
         self.metrics = Metrics()
         self.codex_catalog = CodexCatalogCache()
+        self.audit = AuditLedger(max_records=settings.audit_records)
         self.mcp_catalogue: dict[str, JSON] = {}
         self._discovered: dict[str, dict[str, JSON]] = {}
         self._active: set[PooledSession] = set()
@@ -493,6 +497,7 @@ class KiroBackend:
             client_name="kiro-gateway",
             client_version=__version__,
             request_timeout=120.0,
+            record_frames=self.settings.record_frames or None,
         )
 
     def _resolve_mcp_servers(self, opts: TurnOptions) -> None:
@@ -859,15 +864,27 @@ class KiroBackend:
                 kiro_meta["effort_warning"] = session.effort_error
             if opts.mcp_servers:
                 kiro_meta["mcp_servers"] = [s["name"] for s in opts.mcp_servers]
+            if self.audit.enabled:
+                kiro_meta["audit"] = f"/v1/kiro/sessions/{session.session_id}/audit"
             finish = "stop"
             error: str | None = None
             completed = False
             fingerprint: str | None = None
             try:
+                self.audit.record(
+                    session.session_id,
+                    "turn",
+                    request_id=opts.request_id,
+                    mode="harness" if opts.emulate_tools else "agent",
+                    model=session.model_id,
+                    workspace=pooled.workspace,
+                    reused=not fresh,
+                )
                 async with contextlib.aclosing(
-                    session.prompt(blocks, timeout=self.settings.timeout)
+                    self._turn_events(session, blocks, kiro_meta)
                 ) as turn:
                     async for event in turn:
+                        self._audit_event(session.session_id, event)
                         match event:
                             case TextDelta(text=chunk):
                                 if limiter.hit:
@@ -1037,6 +1054,17 @@ class KiroBackend:
             "workspace": pooled.workspace,
             "tool_mode": "mcp",
         }
+        if self.audit.enabled:
+            kiro_meta["audit"] = f"/v1/kiro/sessions/{session.session_id}/audit"
+        self.audit.record(
+            session.session_id,
+            "turn",
+            request_id=opts.request_id,
+            mode="harness",
+            model=session.model_id,
+            workspace=pooled.workspace,
+            reused=not fresh,
+        )
         LOG.info(
             "turn %s: harness(mcp) engine=%s agent=%s model=%s session=%s%s",
             opts.request_id,
@@ -1151,6 +1179,13 @@ class KiroBackend:
                     case _:
                         pass
             for bridge_call in pending_calls:
+                self.audit.record(
+                    session.session_id,
+                    "harness_tool_call",
+                    id=bridge_call.call_id,
+                    name=bridge_call.name,
+                    arguments=bridge_call.arguments,
+                )
                 part = ToolCallPart(
                     id=f"call_{bridge_call.call_id}",
                     name=bridge_call.name,
@@ -1245,6 +1280,154 @@ class KiroBackend:
             "total_tokens": prompt_tokens + completion_tokens,
             "estimated": True,
         }
+
+    async def _turn_events(
+        self, session: Session, blocks: list[JSON], kiro_meta: JSON
+    ) -> AsyncIterator[Any]:
+        """``session.prompt`` with a stall watchdog.
+
+        A pump task feeds the turn's events through a queue so the consumer can wait with
+        a timeout without cancelling the underlying generator. When nothing arrives for
+        ``stall_timeout`` seconds the turn is cancelled (Kiro acknowledges a cancel on a
+        live turn) and, while recoveries remain, a short continue-nudge is sent to the
+        same session naming the stalled tool instead of re-sending the prompt, which would
+        re-run the very command that stalled.
+        """
+        stall_timeout = self.settings.stall_timeout
+        recoveries = 0
+        current = blocks
+        while True:
+            queue: asyncio.Queue[Any] = asyncio.Queue()
+
+            async def pump(prompt_blocks: list[JSON], sink: asyncio.Queue[Any]) -> None:
+                try:
+                    async with contextlib.aclosing(
+                        session.prompt(prompt_blocks, timeout=self.settings.timeout)
+                    ) as turn:
+                        async for item in turn:
+                            await sink.put(item)
+                except BaseException as error:  # noqa: BLE001 - relayed to the consumer
+                    await sink.put(error)
+                finally:
+                    await sink.put(END)
+
+            task = asyncio.create_task(pump(current, queue), name="turn-pump")
+            open_tools: dict[str, str] = {}
+            stalled = False
+            stalled_tool: str | None = None
+            stop: StopReason | None = None
+            try:
+                while True:
+                    try:
+                        item = await (
+                            asyncio.wait_for(queue.get(), stall_timeout)
+                            if stall_timeout > 0 and not stalled
+                            else asyncio.wait_for(queue.get(), 60.0 if stalled else None)
+                        )
+                    except TimeoutError:
+                        if stalled:
+                            # Cancel was not acknowledged; give up on the session.
+                            raise ACPError(
+                                "Kiro did not acknowledge the cancel after a stalled turn"
+                            ) from None
+                        stalled = True
+                        tool = stalled_tool = next(iter(open_tools.values()), None)
+                        LOG.warning(
+                            "Session %s stalled: no events for %.0fs%s; cancelling",
+                            session.session_id,
+                            stall_timeout,
+                            f" while running {tool!r}" if tool else "",
+                        )
+                        self.audit.record(
+                            session.session_id, "stall", seconds=stall_timeout, tool=tool
+                        )
+                        kiro_meta["stalls"] = kiro_meta.get("stalls", 0) + 1
+                        await session.cancel()
+                        continue
+                    if item is END:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    if isinstance(item, ToolCallEvent):
+                        if item.phase in ("announced", "started", "updated"):
+                            open_tools[item.call.id] = item.call.title or item.call.tool_name or ""
+                        else:
+                            open_tools.pop(item.call.id, None)
+                    if isinstance(item, TurnComplete):
+                        stop = item.stop_reason
+                        if stalled:
+                            break  # decide below whether to nudge or fail
+                    yield item
+            finally:
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+            if not stalled:
+                return
+            tool = stalled_tool
+            if stop == StopReason.CANCELLED and recoveries < self.settings.stall_recoveries:
+                recoveries += 1
+                kiro_meta["stall_recoveries"] = recoveries
+                note = f"⚠ Kiro stalled{f' on {tool}' if tool else ''}; cancelled and asked to continue\n"
+                yield ThoughtDelta(note)
+                current = [
+                    text_block(
+                        "Your previous step"
+                        + (f" ({tool})" if tool else "")
+                        + f" produced no output for {stall_timeout:.0f} seconds and was cancelled by "
+                        "the gateway. Continue the task from where you left off. Do not re-run the "
+                        "exact command that stalled; if it is required, run it with a timeout or in "
+                        "the background and explain what happened."
+                    )
+                ]
+                continue
+            yield TurnComplete(
+                StopReason.CANCELLED,
+                error=f"Kiro stalled for {stall_timeout:.0f}s"
+                + (f" while running {tool}" if tool else "")
+                + " and recovery was exhausted",
+            )
+            return
+
+    def _audit_event(self, session_id: str, event: Any) -> None:
+        if not self.audit.enabled:
+            return
+        if isinstance(event, ToolCallEvent):
+            if event.phase == "started":
+                self.audit.record(
+                    session_id,
+                    "tool_call",
+                    id=event.call.id,
+                    title=event.call.title,
+                    tool_kind=event.call.kind.value,
+                    tool=event.call.tool_name,
+                    input=event.call.raw_input,
+                )
+            elif event.phase == "completed":
+                self.audit.record(
+                    session_id,
+                    "tool_result",
+                    id=event.call.id,
+                    status=event.call.status.value,
+                    output=event.call.raw_output,
+                )
+        elif isinstance(event, PermissionDecision):
+            outcome = event.outcome.get("outcome", {})
+            self.audit.record(
+                session_id,
+                "permission",
+                id=event.request.tool_call_id,
+                title=event.request.title,
+                tool_kind=event.request.kind.value,
+                tool=event.request.tool_name,
+                decision=outcome.get("optionId", outcome.get("outcome")),
+                reason=event.reason,
+            )
+        elif isinstance(event, TurnComplete):
+            self.audit.record(
+                session_id, "turn_end", stop=event.stop_reason.value, error=event.error
+            )
 
     def _record_turn(
         self, opts: TurnOptions, pooled: PooledSession, finish: str, kiro_meta: JSON, fresh: bool

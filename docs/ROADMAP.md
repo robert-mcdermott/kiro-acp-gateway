@@ -153,11 +153,12 @@ window"); parse that into `context_length` (default 200k when absent) and add
 `max_completion_tokens`. Include the same in the Anthropic listing as `max_input_tokens`
 / `max_tokens`, which newer Anthropic SDKs expose.
 
-### 21. Tool-execution audit ledger with redaction *(pattern)* — M
+### 21. Tool-execution audit ledger with redaction *(pattern)* — DONE — M
 Per-session bounded record of permission decisions, tool calls, updates, and cancel
 races, with secrets masked (bearer tokens, `sk-`/`gh*_`/`AKIA` keys, URL credentials).
 Expose as `GET /v1/kiro/sessions/{id}/audit` behind the API key and reference it from
 the `kiro` response field. Complements #14 (metrics).
+*Done (2026-09-17):* `gateway/audit.py` ledger (turns, permissions, tool calls/results, harness calls, stalls) with redaction; `GET /v1/kiro/sessions` and `/v1/kiro/sessions/{id}/audit`; `kiro.audit` in every reply.
 
 ### 22. MCP servers per request and harness MCP discovery *(extends #10)* — DONE — M
 Accept `X-Kiro-MCP-Servers` / body `mcp_servers` (validated against an allow-list) in
@@ -208,7 +209,7 @@ that runs `uv run kiro-gateway` with an env file, plus `kiro-gateway --print-ser
 to emit the unit for review. Pairs with the Dockerfile in #18.
 *Done (2026-09-17):* `scripts/install-service.sh` and `kiro-gateway --print-service launchd|systemd` (unit-tested; launchd form verified on this machine).
 
-### 27. Per-model notes in the model listing — S
+### 27. Per-model notes in the model listing — DONE — S
 Record observed capabilities in `/v1/models` descriptions and in
 `docs/KIRO_ACP_NOTES.md`: which models emit thought chunks (their finding: opus yes,
 sonnet no on v2), which accept `/effort`, and which follow the emulated tool protocol
@@ -221,6 +222,7 @@ Kiro Crew is AWS's persistent-workspace product that drives `kiro-cli acp` from 
 Its "Gateway" is its own daemon, not an LLM API. It multiplexes many sessions in one
 `kiro-cli` process, which this project deliberately does not do, but its wire-level
 findings transfer directly. Items are ordered by value for a general-purpose API gateway.
+*Done (2026-09-17):* Observed behaviours recorded in `docs/KIRO_ACP_NOTES.md` (per-model section). The `/v1/models` descriptions stay Kiro's own; notes that are not confirmed for a model are marked as such.
 
 ### 29. Effort via `_kiro.dev/commands/execute` on v2 — DONE — S
 Kiro Crew sets effort with the request
@@ -266,13 +268,14 @@ restarts the process; adopt the same-process probe and the never-overwrite rule 
 `KiroBackend.models()`.
 *Done (2026-09-17):* The fresh-session retry already ran on the same process; the catalogue cache now never replaces a good snapshot with an empty answer.
 
-### 34. Stall detection and continue-nudge for long turns — M
+### 34. Stall detection and continue-nudge for long turns — DONE — M
 Beyond the hard `timeout`, add a per-turn watchdog: no event for N seconds while a tool
 call is open marks the turn suspect; probe with `session/cancel` (kiro-cli acks a cancel
 on a live turn too, so a probe-induced `cancelled` is reclassified as `stale_recover`);
 on recovery send a short continue-nudge naming the stalled tool instead of re-sending
 the prompt (re-sending re-ran the command that stalled). Applies to agent-mode turns;
 harness turns already return on each tool call.
+*Done (2026-09-17):* Pump-and-watchdog in `KiroBackend._turn_events`: silence > `KIRO_GATEWAY_STALL_TIMEOUT` cancels the turn and sends a continue-nudge naming the stalled tool (up to `KIRO_GATEWAY_STALL_RECOVERIES`), else `504 kiro_stall`. Verified live on Kiro 2.22 v3: a foreground `sleep 40` was cancelled at 8 s and the model continued.
 
 ### 35. Process hygiene — DONE — S
 Spawn `kiro-cli` with `start_new_session=True` (POSIX) / `CREATE_NEW_PROCESS_GROUP`
@@ -289,11 +292,12 @@ images above a configurable edge/byte limit before `session/prompt`, and only se
 blocks when `promptCapabilities.image` is advertised.
 *Done (2026-09-17):* `KIRO_GATEWAY_MAX_IMAGE_BYTES` (5 MiB) rejects oversized images with `400 image_too_large`; images are replaced by a note when the agent does not advertise image input.
 
-### 37. Frame recorder and replay fixtures — M
+### 37. Frame recorder and replay fixtures — DONE — M
 `KIRO_GATEWAY_RECORD_FRAMES=<dir>` writes every ACP frame with a provenance header
 (cli version, engine, model); a replay harness feeds recorded frames to the client in
 tests. Extend the fake agent with `permission`, `gated`, `slow-noack`, `refusal`, and
 `maxtokens` scenarios modelled on their `testing/fake_acp_backend.py` markers.
+*Done (2026-09-17):* `acp/recorder.py` (`KIRO_ACP_RECORD_FRAMES` / `KIRO_GATEWAY_RECORD_FRAMES`), `tests/fake_agent/replay.py`, a scrubbed real Kiro 2.22 v3 fixture replayed in `test_acp_client.py`, and fake-agent scenarios `stall`, `noack`, `maxtokens`.
 
 ### 38. Context usage and compaction for affinity sessions — PARTLY DONE — S/M
 Expose `contextUsagePercentage` (v2 metadata, v3 `session_info_update`

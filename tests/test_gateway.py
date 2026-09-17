@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import httpx
@@ -13,11 +14,15 @@ from tests.conftest import fake_agent_command
 
 
 class FakeKiroBackend(KiroBackend):
-    """Backend that launches the scripted fake agent instead of kiro-cli."""
+    """Backend that launches the scripted fake agent (or another command) instead of kiro-cli."""
+
+    def __init__(self, settings: Settings, command: list[str] | None = None) -> None:
+        super().__init__(settings)
+        self._command = command
 
     def _make_agent(self, **kwargs):
         agent = super()._make_agent(**kwargs)
-        agent.options.raw_command = fake_agent_command()
+        agent.options.raw_command = self._command or fake_agent_command()
         agent.client.command = agent.options.command()
         return agent
 
@@ -1591,6 +1596,137 @@ async def test_harness_agent_sent_over_the_wire_on_v3(workspace: Path, engine: s
             assert response.status_code == 200, response.text
             text = response.json()["choices"][0]["message"]["content"]
             assert text.startswith("mode kiro-gateway-harness;") and "tools: " in text
+
+
+@pytest.fixture
+async def stall_client(workspace: Path, engine: str):
+    settings = make_settings(workspace, engine=engine, stall_timeout=0.5, stall_recoveries=1)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gw",
+            headers={"Authorization": "Bearer secret"},
+            timeout=60,
+        ) as http:
+            http.app = app  # type: ignore[attr-defined]
+            yield http
+
+
+async def test_stalled_turn_is_cancelled_and_nudged(stall_client: httpx.AsyncClient) -> None:
+    response = await stall_client.post(
+        "/v1/chat/completions",
+        json={"model": "x", "messages": [{"role": "user", "content": "stall"}]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    message = body["choices"][0]["message"]
+    assert "resumed after stall" in message["content"]
+    assert body["kiro"]["stalls"] == 1 and body["kiro"]["stall_recoveries"] == 1
+    assert "Kiro stalled on Running: sleep 999" in (message.get("reasoning_content") or "")
+    # the ledger saw the stall and the recovery turn
+    audit = await stall_client.get(body["kiro"]["audit"])
+    kinds = [r["kind"] for r in audit.json()["records"]]
+    assert "stall" in kinds and kinds.count("turn_end") >= 1
+
+
+async def test_stall_without_recovery_is_an_error(workspace: Path, engine: str) -> None:
+    settings = make_settings(workspace, engine=engine, stall_timeout=0.5, stall_recoveries=0)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://gw", headers={"Authorization": "Bearer secret"}
+        ) as http:
+            response = await http.post(
+                "/v1/chat/completions",
+                json={"model": "x", "messages": [{"role": "user", "content": "stall"}]},
+            )
+            assert response.status_code == 504
+            assert response.json()["error"]["code"] == "kiro_stall"
+
+
+async def test_audit_ledger_records_and_redacts(client: httpx.AsyncClient) -> None:
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "x", "messages": [{"role": "user", "content": "tool"}]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    session_id = body["kiro"]["session_id"]
+    assert body["kiro"]["audit"] == f"/v1/kiro/sessions/{session_id}/audit"
+    listing = await client.get("/v1/kiro/sessions")
+    assert any(row["session_id"] == session_id for row in listing.json()["data"])
+    audit = await client.get(body["kiro"]["audit"])
+    assert audit.status_code == 200
+    kinds = [r["kind"] for r in audit.json()["records"]]
+    assert kinds[0] == "turn" and "tool_call" in kinds and "permission" in kinds
+    assert "tool_result" in kinds and kinds[-1] == "turn_end"
+    permission = next(r for r in audit.json()["records"] if r["kind"] == "permission")
+    assert permission["decision"] == "allow_once"
+    missing = await client.get("/v1/kiro/sessions/nope/audit")
+    assert missing.status_code == 404
+    from kiro_acp.gateway.audit import redact
+
+    masked = redact(
+        {
+            "cmd": "curl -H 'Authorization: Bearer abcdefghijklmnop' https://u:pw@host/x",
+            "api_key": "sk-1234567890abcdef",
+            "nested": {"token": "ghp_ABCDEFGHIJKLMNOPQRSTUV"},
+        }
+    )
+    assert "abcdefghijklmnop" not in masked["cmd"] and "u:pw@" not in masked["cmd"]
+    assert masked["api_key"] == "[REDACTED]" and masked["nested"]["token"] == "[REDACTED]"
+
+
+async def test_frames_are_recorded_and_replayable(
+    workspace: Path, engine: str, tmp_path: Path
+) -> None:
+    record_dir = tmp_path / "frames"
+    settings = make_settings(workspace, engine=engine, record_frames=str(record_dir))
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://gw", headers={"Authorization": "Bearer secret"}
+        ) as http:
+            first = await http.post(
+                "/v1/chat/completions",
+                json={"model": "x", "messages": [{"role": "user", "content": "tool"}]},
+            )
+            assert first.status_code == 200
+    recordings = [
+        path for path in record_dir.glob("acp-*.jsonl") if "session/prompt" in path.read_text()
+    ]
+    assert recordings, "no recording with a prompt turn was written"
+    lines = [json.loads(line) for line in recordings[-1].read_text().splitlines()]
+    assert lines[0]["kiro_acp_recording"] == 1 and lines[0]["engine"] == engine
+    methods = [entry["frame"].get("method") for entry in lines[1:] if entry["dir"] == "out"]
+    assert methods[:2] == ["initialize", "session/new"] and "session/prompt" in methods
+    # Replay the recording through a gateway whose "Kiro" is the replay agent.
+    replay_cmd = [
+        sys.executable,
+        str(Path(__file__).parent / "fake_agent" / "replay.py"),
+        str(recordings[-1]),
+    ]
+    settings2 = make_settings(workspace, engine=engine, provision_harness_agent=False)
+    backend = FakeKiroBackend(settings2, command=replay_cmd)
+    app2 = create_app(settings2, backend=backend)
+    async with app2.router.lifespan_context(app2):
+        transport = httpx.ASGITransport(app=app2)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://gw", headers={"Authorization": "Bearer secret"}
+        ) as http:
+            replayed = await http.post(
+                "/v1/chat/completions",
+                json={"model": "x", "messages": [{"role": "user", "content": "tool"}]},
+            )
+            assert replayed.status_code == 200, replayed.text
+            assert (
+                replayed.json()["choices"][0]["message"]["content"]
+                == first.json()["choices"][0]["message"]["content"]
+            )
 
 
 async def test_metrics_endpoint(client: httpx.AsyncClient) -> None:

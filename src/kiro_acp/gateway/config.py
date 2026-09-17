@@ -163,6 +163,25 @@ class Settings(BaseSettings):
         ge=0,
         description="Requests per minute per API key (or client address); 0 disables",
     )
+    stall_timeout: float = Field(
+        default=600.0,
+        description="Seconds without any event from Kiro before an agent-mode turn is considered stalled "
+        "(cancelled and, if recoveries remain, nudged to continue); 0 disables",
+    )
+    stall_recoveries: int = Field(
+        default=1,
+        ge=0,
+        description="How many times a stalled turn is nudged to continue before it fails",
+    )
+    audit_records: int = Field(
+        default=500,
+        ge=0,
+        description="Audit ledger records kept per session (permissions, tool calls, turns); 0 disables the ledger",
+    )
+    record_frames: str = Field(
+        default="",
+        description="Directory to record every ACP frame to (JSONL, one file per Kiro process)",
+    )
     shutdown_grace: float = Field(
         default=10.0, description="Seconds to wait for in-flight turns to cancel during shutdown"
     )

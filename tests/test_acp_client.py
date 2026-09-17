@@ -305,3 +305,29 @@ async def test_concurrent_turns_are_serialized(workspace: Path, engine: str) -> 
             session.prompt_text("echo: a"), session.prompt_text("echo: b")
         )
         assert sorted(r.text for r in results) == ["a", "b"]
+
+
+async def test_replay_recorded_kiro_v3_session(workspace: Path) -> None:
+    """A real kiro-cli 2.22 v3 recording replayed through the client (no Kiro needed)."""
+    import sys
+
+    fixture = Path(__file__).parent / "fixtures" / "acp_frames" / "kiro-cli-2.22.0-v3-hello.jsonl"
+    replay = [sys.executable, str(Path(__file__).parent / "fake_agent" / "replay.py"), str(fixture)]
+    agent = KiroAgent(
+        KiroLaunchOptions(engine="v3", raw_command=replay, model="gpt-5.6-luna"), cwd=workspace
+    )
+    await agent.start()
+    try:
+        assert agent.info.agent_info.name  # initialize parsed
+        session = await agent.new_session()
+        assert "gpt-5.6-luna" in session.info.model_ids and len(session.info.model_ids) >= 10
+        assert session.info.config_option("model") is not None
+        assert session.model_id == "gpt-5.6-luna"
+        result = await session.prompt_text("Reply with exactly the single word: hello")
+        assert result.ok and result.text.strip() == "hello"
+        assert result.metadata.get("meteringUsage") or result.metadata.get("credits") is not None
+        # The CLI run that was recorded did not delete its session, so the replay has no
+        # `_kiro/session/delete` frame and the client reports "cannot delete" rather than failing.
+        assert await agent.delete_session(session.session_id) is False
+    finally:
+        await agent.close()

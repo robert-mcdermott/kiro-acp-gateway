@@ -715,6 +715,10 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_RATE_LIMIT_RPM` | `0` | Requests per minute per API key (per client address without keys); `0` disables. Exceeding it returns `429`. |
 | `KIRO_GATEWAY_SHUTDOWN_GRACE` | `10` | Seconds to let in-flight turns cancel on shutdown. |
 | `KIRO_GATEWAY_TIMEOUT` | `900` | Seconds per turn before cancellation. |
+| `KIRO_GATEWAY_STALL_TIMEOUT` | `600` | Seconds of silence from Kiro before an agent-mode turn is cancelled and nudged to continue; `0` disables. |
+| `KIRO_GATEWAY_STALL_RECOVERIES` | `1` | Continue-nudges per request before a stall becomes `504 kiro_stall`. |
+| `KIRO_GATEWAY_AUDIT_RECORDS` | `500` | Audit ledger records per session (`/v1/kiro/sessions/{id}/audit`); `0` disables. |
+| `KIRO_GATEWAY_RECORD_FRAMES` | empty | Directory to write every ACP frame to (JSONL per Kiro process) for debugging and replay. |
 | `KIRO_GATEWAY_SSE_KEEPALIVE` | `15` | Seconds of stream silence before a keepalive (`ping` / SSE comment); `0` disables. |
 | `KIRO_GATEWAY_WARMUP` | `true` | Load the model catalogue in the background at startup. |
 | `KIRO_GATEWAY_ENFORCE_MAX_TOKENS` | `false` | Cut output at the request's `max_tokens` using the token estimator. `stop` sequences are always enforced. |
@@ -772,7 +776,7 @@ Kiro failures are classified from their message so clients can decide whether to
 | 429 | `rate_limited`, `usage_limit` | Throttled, or the plan's usage limit is reached (`Retry-After` 30 s / 1 h). |
 | 502 | `kiro_auth`, `kiro_connection`, `kiro_error` | Not signed in or the token expired; connection dropped; anything unclassified. |
 | 503 | `model_unavailable`, `kiro_unavailable` | Capacity for that model, or Kiro/backend overloaded; also `kiro-cli` missing. |
-| 504 | `kiro_timeout` | The turn or a backend call timed out. |
+| 504 | `kiro_timeout`, `kiro_stall` | The turn or a backend call timed out; or Kiro went silent, was cancelled, and recovery was exhausted. |
 
 A model refusal or content filter is not an error: the reply completes with
 `finish_reason: "content_filter"` (OpenAI) / `stop_reason: "refusal"` (Anthropic) and the
@@ -810,6 +814,33 @@ keep running their tools on the host; only Kiro's own tools are confined to the 
 workspace. Until Kiro is logged in, `/health` answers but `/v1/models` returns
 `502 kiro_auth` with Kiro's "not logged in" message. Podman ignores the `HEALTHCHECK`
 line (OCI format); build with `--format docker` if you want it.
+
+**Stalled turns.** Kiro emits nothing while a tool runs, so a hung command would only
+end at `KIRO_GATEWAY_TIMEOUT`. In agent mode the gateway also watches for silence:
+after `KIRO_GATEWAY_STALL_TIMEOUT` seconds (600 by default) without any event it cancels
+the turn (Kiro acknowledges a cancel on a live turn) and, up to
+`KIRO_GATEWAY_STALL_RECOVERIES` times (1), sends the same session a short instruction to
+continue from where it left off without re-running the command that stalled, naming
+that command. The reply carries `kiro.stalls` and `kiro.stall_recoveries`, and the
+recovery note appears in the reasoning stream. When recoveries are exhausted the request
+fails with `504 kiro_stall`. Harness turns are not affected: they return to the client on
+every tool call.
+
+**Audit ledger.** Every session keeps a bounded record (`KIRO_GATEWAY_AUDIT_RECORDS`,
+500 per session, `0` disables) of turns, permission decisions, Kiro's tool calls and
+results, harness tool calls, stalls, and turn ends, with secrets masked (bearer tokens,
+`sk-`/`gh*_`/`AKIA`/`xox*` keys, URL credentials, and any `token`/`secret`/`password`
+field). `GET /v1/kiro/sessions` lists sessions with record counts and
+`GET /v1/kiro/sessions/{id}/audit` returns the records; both need the API key, and each
+reply's `kiro.audit` gives the path for its session.
+
+**Recording ACP traffic.** `KIRO_GATEWAY_RECORD_FRAMES=<dir>` (gateway) or
+`KIRO_ACP_RECORD_FRAMES=<dir>` (CLI) writes every JSON-RPC frame exchanged with each
+`kiro-cli` process to a JSONL file with a header naming the command, engine, and model.
+Recordings can be replayed by `tests/fake_agent/replay.py` to reproduce a session without
+Kiro; `tests/fixtures/acp_frames/` keeps scrubbed recordings of real Kiro versions as
+regression fixtures. Recordings contain prompts, tool arguments, and outputs verbatim, so
+treat them as sensitive.
 
 **Metrics.** `GET /metrics` (same key as `/v1`) serves Prometheus text:
 `kiro_gateway_turns_total{mode,engine,model,finish}`, `kiro_gateway_turn_seconds`

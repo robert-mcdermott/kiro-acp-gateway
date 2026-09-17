@@ -13,6 +13,9 @@ Behaviour is driven by the *prompt text* so tests can request scenarios:
 * ``"/effort <level>"``       – replies ``Effort set to <level>`` (v2 style).
 * ``"refuse"``                – answers, then sends ``_kiro.dev/metadata`` with ``CONTENT_FILTERED``.
 * ``"mcp?"``                  – lists the names of the session's ``mcpServers``.
+* ``"stall"``                 – opens a tool call and goes silent until cancelled (then ``cancelled``).
+* ``"noack"``                 – ignores ``session/cancel`` for 3 s (a wedged agent).
+* ``"maxtokens"``             – ends the turn with ``max_tokens``.
 * ``"agent?"``                – reports the current mode and, for a wire-injected custom agent, its prompt/tools.
 * ``_kiro.dev/commands/execute`` (v2) – object-form ``effort`` command answered in the response.
 * anything else              – replies with a fixed sentence.
@@ -341,6 +344,45 @@ class Agent:
                 await say("result: " + result)
             await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 5})
             return {"stopReason": "end_turn"}
+        if text == "stall":
+            await say("starting a long command ")
+            await self.update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "stall-1",
+                    "title": "Running: sleep 999",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"command": "sleep 999"},
+                },
+            )
+            for _ in range(400):  # up to 20 s: wait for the client's cancel
+                if session_id in self.cancelled:
+                    self.cancelled.discard(session_id)
+                    await self.update(
+                        session_id,
+                        {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": "stall-1",
+                            "status": "failed",
+                        },
+                    )
+                    return {"stopReason": "cancelled"}
+                await asyncio.sleep(0.05)
+            return {"stopReason": "end_turn"}
+        if text == "noack":
+            # Ignores session/cancel entirely (a wedged agent).
+            await say("wedged ")
+            await asyncio.sleep(3)
+            return {"stopReason": "end_turn"}
+        if text.startswith("Your previous step"):
+            await say("resumed after stall")
+            await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 1})
+            return {"stopReason": "end_turn"}
+        if text == "maxtokens":
+            await say("truncated output")
+            return {"stopReason": "max_tokens"}
         if text == "mcp?":
             names = [s.get("name") for s in session.get("mcp") or []]
             await say("mcp servers: " + (", ".join(names) or "none"))

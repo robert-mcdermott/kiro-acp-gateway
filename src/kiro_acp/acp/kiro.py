@@ -26,6 +26,7 @@ from typing import Any
 from kiro_acp.acp.client import ACPClient
 from kiro_acp.acp.errors import ACPError, ACPRemoteError
 from kiro_acp.acp.handlers import ClientHandlers
+from kiro_acp.acp.recorder import FrameRecorder
 from kiro_acp.acp.session import EffortNotSupported, Session
 from kiro_acp.acp.types import JSON, InitializeResult, ModelInfo, SessionInfo
 
@@ -93,9 +94,23 @@ class KiroAgent:
         client_name: str = "kiro-acp",
         client_version: str = "0.1.0",
         request_timeout: float = 60.0,
+        record_frames: str | None = None,
     ) -> None:
         self.options = options or KiroLaunchOptions()
         self.cwd = os.path.abspath(cwd or os.getcwd())
+        record_dir = record_frames or os.environ.get("KIRO_ACP_RECORD_FRAMES")
+        recorder = None
+        if record_dir:
+            recorder = FrameRecorder(
+                record_dir,
+                meta={
+                    "client": f"{client_name} {client_version}",
+                    "command": self.options.command(),
+                    "engine": self.options.engine,
+                    "model": self.options.model,
+                    "cwd": self.cwd,
+                },
+            )
         env = dict(os.environ)
         env.update(self.options.env)
         # Marker for orphan detection (``kiro-acp doctor``): the pid that spawned this agent.
@@ -108,6 +123,7 @@ class KiroAgent:
             client_name=client_name,
             client_version=client_version,
             request_timeout=request_timeout,
+            recorder=recorder,
         )
         self.sessions: dict[str, Session] = {}
         self.model_list_timeout = 20.0

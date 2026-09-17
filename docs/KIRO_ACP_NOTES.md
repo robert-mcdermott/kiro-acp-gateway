@@ -138,3 +138,18 @@ recorded for the roadmap (P6):
 | `session/request_permission._meta.kiro.consent` | agent → client | v3: `{capability, resource, askType}`. |
 | `initialize.protocolVersion` | client → agent | Kiro Crew sends `"2025-08-22"` on v2 and `1` on v3; kiro-cli 2.21 answers `1` either way. |
 
+## Per-model observations (kiro-cli 2.22, September 2026)
+
+What this project has actually seen; "reported" marks findings taken from other
+projects' notes rather than reproduced here. Check `uv run kiro-acp models` for the
+current catalogue.
+
+| Model | Native tool calls (mcp mode) | Emulated tool protocol (emulate mode) | Thought chunks | Effort | Notes |
+|---|---|---|---|---|---|
+| `claude-sonnet-5` | reliable (Claude Code verified) | refused the harness framing on v3 as "injected instructions" until the identity-preserving prompt; fine on v2 | not observed on v2 | v3: only when the model advertises the option | Gateway default (Kiro's default). |
+| `claude-sonnet-4.6` | reliable (Claude Code, Codex, OpenCode verified) | reliable | not observed on v2 | v2: via `commands/execute` | Recommended general-purpose choice. |
+| `claude-opus-4.8` | reliable | reliable | emitted on v2 (reported) | v2: via `commands/execute` | Highest capability; slower. |
+| `gpt-5.6-luna` | reliable (Codex code mode `exec`, inline-agent MCP tool, stall recovery verified) | mostly (small model; keep prompts short) | not observed | v2: via `commands/execute`; v3 `/effort` rejected as chat | Small, fast, inexpensive: use for background calls and tests. |
+| `gpt-5.6-terra` / `gpt-5.6-sol` | works | mostly (reported) | not observed | as luna | Experimental previews. |
+| `claude-haiku-4.5` | untested | unsuitable for harness prompts (loses the tool list) | | | Not used by this project. |
+
