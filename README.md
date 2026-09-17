@@ -317,6 +317,25 @@ Then `export KIRO_GATEWAY_KEY=your-gateway-key` and run `codex`.
 }
 ```
 
+### Two modes
+
+The gateway picks a path for every request based on one thing: whether the request
+carries tool definitions (`tools` in OpenAI requests, `tools` in Anthropic requests).
+
+| | Harness mode | Agent mode |
+|---|---|---|
+| Triggered by | request includes `tools` (Claude Code, Codex, OpenCode, function-calling scripts) | request has no `tools` (pipeline scripts, curl, plain SDK calls) |
+| Who runs tools | the client, on its own machine and directory | Kiro, inside `KIRO_GATEWAY_WORKSPACE` |
+| Kiro agent | tool-less `KIRO_GATEWAY_HARNESS_AGENT` | `KIRO_GATEWAY_AGENT` (Kiro default) |
+| Engine | `KIRO_GATEWAY_HARNESS_ENGINE` (v2) | `KIRO_GATEWAY_ENGINE` (v3) |
+| Permissions | `KIRO_GATEWAY_HARNESS_PERMISSIONS` (deny) | `KIRO_GATEWAY_PERMISSIONS` |
+| Output | text plus `tool_calls` / `function_call` / `tool_use` | text; Kiro's own activity as reasoning and in `kiro.tool_calls` |
+
+A script that wants Kiro's own agentic behaviour must therefore send no `tools`. If it
+passes tools for some other reason (an SDK helper that always attaches them, for
+example), set `KIRO_GATEWAY_TOOL_MODE=ignore` to drop them and force agent mode, or
+`reject` to fail such requests with a 400. Each turn logs which mode and engine it ran on.
+
 ### How requests are translated
 
 **Models.** Requests may name any Kiro model id (`uv run kiro-acp models`). Common aliases
@@ -413,7 +432,7 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_DELETE_SESSIONS` | `true` | Delete Kiro's stored copy of gateway sessions when they are closed (v3). |
 | `KIRO_GATEWAY_MAX_CONCURRENCY` | `4` | Simultaneous turns. |
 | `KIRO_GATEWAY_TIMEOUT` | `900` | Seconds per turn before cancellation. |
-| `KIRO_GATEWAY_TOOL_MODE` | `emulate` | `emulate`, `reject`, or `ignore` client tools. |
+| `KIRO_GATEWAY_TOOL_MODE` | `emulate` | What to do with client tool definitions: `emulate` (harness mode), `ignore` (drop them and run agent mode), or `reject` (400). |
 | `KIRO_GATEWAY_TOOL_ACTIVITY` | `thought` | `thought`, `text`, or `none`. |
 | `KIRO_GATEWAY_EXPOSE_THOUGHTS` | `true` | Forward Kiro's thinking. |
 | `KIRO_GATEWAY_USAGE_ESTIMATES` | `true` | Estimated token counts. |
