@@ -206,12 +206,119 @@ Record observed capabilities in `/v1/models` descriptions and in
 sonnet no on v2), which accept `/effort`, and which follow the emulated tool protocol
 reliably in emulate mode (Sonnet/Opus yes; GPT 5.6 previews mostly).
 
+## P6 — Patterns from Kiro Crew (kirodotdev/kirocrew, reviewed 2026-09-17)
+
+Kiro Crew is AWS's persistent-workspace product that drives `kiro-cli acp` from Python
+(`src/kiro_crew/acp/{runtime,session_handle,_dispatch,types}.py`, `acp/harness/{kiro,kas}.py`).
+Its "Gateway" is its own daemon, not an LLM API. It multiplexes many sessions in one
+`kiro-cli` process, which this project deliberately does not do, but its wire-level
+findings transfer directly. Items are ordered by value for a general-purpose API gateway.
+
+### 29. Effort via `_kiro.dev/commands/execute` on v2 — S
+Kiro Crew sets effort with the request
+`{"sessionId", "command": {"command": "effort", "args": {...}}}` (object form; the
+string form gets no response on 2.14) and reads the outcome from the response
+`result.text`. We send `/effort <level>` as a prompt turn, which costs a turn, can
+produce assistant text, and cannot be distinguished from a real reply. Switch v2
+`set_effort` to the command request with the prompt form as a fallback for older CLIs.
+
+### 30. Wire-injected agents on v3 — M
+On the KAS engine `session/new` accepts `_meta.kiro.customAgents: [<agent json>...]`
+(max 50) and `session/set_mode` activates one, so no file in `~/.kiro/agents` is needed.
+Use it for v3 harness turns and for per-request agent definitions (an API caller could
+supply prompt, tools, and MCP servers inline, which #10/#22 want anyway). Keep file
+provisioning for v2, which only takes `--agent <name>` at launch.
+
+### 31. Surface model refusals and content filtering — S
+`_kiro.dev/metadata` can carry `stopReason: "CONTENT_FILTERED"` and
+`refusal: {category, explanation, recommendedModel}`. Map it to OpenAI
+`finish_reason: "content_filter"` / Anthropic `stop_reason: "refusal"`, never retry it,
+and expose `recommendedModel` under `kiro`. Today the fields ride along in metadata
+untyped.
+
+### 32. Finer Kiro error classification — S
+Their raw-error classifier (`acp/client.py` ~2612-2800) distinguishes, in precedence
+order: unentitled model, usage limit, malformed request, model unavailable / invalid
+model id (with the rejected id captured so a retry can substitute an advertised one),
+throttle, auth, session expired (401/403, invalid bearer), connection, 5xx/"try again",
+and `already in progress` as a distinct busy signal. Ours has four buckets. Add the
+model and busy classes (400 `model_not_entitled`, 409 `session_busy`), keep a table test
+per class.
+
+### 33. Entitlement probe for the model catalogue — S
+`session/new` racing a token refresh answers with the default free-tier model set. Their
+fix: a throwaway `session/new` with `mcpServers: []` on the same live process, read
+`models`/`configOptions`, terminate it; single-flight with a 20 s TTL; an empty result is
+"no evidence" and never replaces a held snapshot. Our cold-start retry is similar but
+restarts the process; adopt the same-process probe and the never-overwrite rule in
+`KiroBackend.models()`.
+
+### 34. Stall detection and continue-nudge for long turns — M
+Beyond the hard `timeout`, add a per-turn watchdog: no event for N seconds while a tool
+call is open marks the turn suspect; probe with `session/cancel` (kiro-cli acks a cancel
+on a live turn too, so a probe-induced `cancelled` is reclassified as `stale_recover`);
+on recovery send a short continue-nudge naming the stalled tool instead of re-sending
+the prompt (re-sending re-ran the command that stalled). Applies to agent-mode turns;
+harness turns already return on each tool call.
+
+### 35. Process hygiene — S
+Spawn `kiro-cli` with `start_new_session=True` (POSIX) / `CREATE_NEW_PROCESS_GROUP`
+(Windows) and kill the process group on close, so `kiro-cli-chat` and MCP children never
+outlive the gateway (stale `kiro-cli acp` processes were observed after abrupt exits).
+Tag children with a marker env var (`KIRO_GATEWAY_SPAWNED=<pid>`) so `kiro-acp doctor`
+can list and reap orphans. Bound stdout with a reader limit (already 64 MB).
+
+### 36. Image payload guard — S
+An oversized image block wedges a session (their design note
+`docs/architecture/design-notes/oversized-image-session-wedge.md`). Downscale or reject
+images above a configurable edge/byte limit before `session/prompt`, and only send image
+blocks when `promptCapabilities.image` is advertised.
+
+### 37. Frame recorder and replay fixtures — M
+`KIRO_GATEWAY_RECORD_FRAMES=<dir>` writes every ACP frame with a provenance header
+(cli version, engine, model); a replay harness feeds recorded frames to the client in
+tests. Extend the fake agent with `permission`, `gated`, `slow-noack`, `refusal`, and
+`maxtokens` scenarios modelled on their `testing/fake_acp_backend.py` markers.
+
+### 38. Context usage and compaction for affinity sessions — S/M
+Expose `contextUsagePercentage` (v2 metadata, v3 `session_info_update`
+`context_usage`) in every response's `kiro` block and in `kiro-acp chat`. For agent-mode
+affinity sessions add an opt-in auto-compaction: send `/compact` as a prompt when usage
+crosses a threshold and wait for `_kiro.dev/compaction/status`; a fresh metadata frame
+follows about a second later. Harness clients manage their own context, so leave them
+alone.
+
+### 39. Trusted tool identity in rules and activity — S
+`tool_call._meta.kiro.toolName` is the real `@server/tool` identity and
+`rawInput.__tool_use_purpose` is the model's one-line reason; the `title` is
+model-authored. Match permission rules against the trusted name (their auto-approve
+globs do), and show the purpose line in tool activity rendering.
+
+### 40. Session file load and resume — S
+`session/load` accepts `_meta: {"_kiro.dev/session_file": <path>}` and success is
+detected by `modes` in the response; `session/resume` exists for engines without load.
+Register the update subscription only after `session/load` returns because kiro-cli
+replays the transcript. Use it for `kiro-acp chat --resume` on both engines.
+
+### 41. Mid-turn steering (v2) — S, low priority
+`_session/steer {sessionId, message: "<user_message>...</user_message>"}` injects a
+message into a running turn, confirmed by a `steering_consumed` update. Could back a
+"send while streaming" endpoint for agent-mode clients.
+
 ### Already covered here (confirmed by the review)
 Embedded `role: "system"` messages inside Anthropic `messages` (Claude Code 2.1.215+) are
 lifted into the system prompt; `GET /v1/models/{id}` is permissive for clients that probe
 it; `previous_response_id` and `store` are implemented rather than rejected; the SSE
 keepalive on `/v1/responses` is a comment line, never an invented event type; sessions are
 deleted rather than abandoned; per-request effort works on v2 via `/effort`.
+
+Confirmed again by the Kiro Crew review: `mcpServers` is always sent (a missing field
+makes kiro-cli exit cleanly with rc 0); permission denials answer the advertised reject
+option and only fall back to `cancelled`, which kiro-cli treats as cancelling the whole
+turn; credits are read from `_kiro.dev/metadata.meteringUsage` (v2) and
+`session_info_update._meta.kiro.turn_completion` (v3); `--auth-method cli` keeps the
+`_kiro/auth/getAccessToken` server request inside kiro-cli; `clientInfo.name` is what
+kiro-cli reports in telemetry.
 
 ## Deliberately not planned
 

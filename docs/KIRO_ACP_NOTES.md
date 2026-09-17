@@ -118,3 +118,23 @@ agents with invalid configs (it reports those via `_kiro/customAgent/config_erro
 `KIRO_API_KEY` to an unrelated value breaks Kiro's authentication and empties the model
 catalogue, which is why this project namespaces its own variables as `KIRO_ACP_*` and
 `KIRO_GATEWAY_*`.
+
+## Extensions seen in Kiro Crew (not yet used here)
+
+Observed in kirodotdev/kirocrew (`src/kiro_crew/acp/`, kiro-cli 2.14–2.21 probes),
+recorded for the roadmap (P6):
+
+| Method / field | Direction | Notes |
+|---|---|---|
+| `_kiro.dev/commands/execute` | client → agent | `{"sessionId", "command": {"command": "effort", "args": {...}}}`; string form gets no response; output in `result.text`. v2 only. |
+| `session/new._meta.kiro.customAgents` | client → agent | v3: inline agent definitions (max 50), activated with `session/set_mode`. |
+| `_kiro.dev/session/terminate` | client → agent | v2: evict a session from a multiplexed process and reap its MCP children. |
+| `_session/steer` | client → agent | v2: `{"sessionId", "message": "<user_message>...</user_message>"}` mid-turn; `steering_consumed` update confirms. |
+| `session/load._meta["_kiro.dev/session_file"]` | client → agent | Load from an explicit session file; success = `modes` in the response; transcript is replayed as updates. |
+| `_kiro/auth/getAccessToken` | agent → client | v3 without `--auth-method cli`: client must answer `{accessToken, expiresAt, ...}` or error `-32000`. |
+| `_kiro.dev/metadata.stopReason` / `refusal` | agent → client | `CONTENT_FILTERED` with `refusal: {category, explanation, recommendedModel}`. |
+| `_kiro.dev/compaction/status`, `clear/status`, `agent/switched`, `mcp/oauth_request`, `mcp/server_initialized`, `mcp/server_init_failure`, `subagent/list_update` | agent → client | Notifications; `/compact` is sent as a prompt and a fresh metadata frame follows compaction by about a second. |
+| `tool_call._meta.kiro.toolName`, `rawInput.__tool_use_purpose` | agent → client | Trusted tool identity and the model's stated purpose; `title` is model-authored. |
+| `session/request_permission._meta.kiro.consent` | agent → client | v3: `{capability, resource, askType}`. |
+| `initialize.protocolVersion` | client → agent | Kiro Crew sends `"2025-08-22"` on v2 and `1` on v3; kiro-cli 2.21 answers `1` either way. |
+
