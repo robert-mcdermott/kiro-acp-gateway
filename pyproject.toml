@@ -1,6 +1,6 @@
 [project]
 name = "kiro-acp-gateway"
-version = "0.1.1"
+version = "0.1.2"
 description = "Agent Client Protocol (ACP) client library, CLI utility, and OpenAI/Anthropic-compatible gateway for the Kiro CLI"
 readme = "README.md"
 license = "Apache-2.0"

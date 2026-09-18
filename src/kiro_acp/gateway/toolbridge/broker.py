@@ -38,18 +38,26 @@ class BridgeSession:
         with contextlib.suppress(ConnectionError, OSError):
             await self.writer.drain()
 
-    async def deliver_result(self, call_id: str, content: str, *, is_error: bool = False) -> bool:
+    async def deliver_result(
+        self,
+        call_id: str,
+        content: str,
+        *,
+        is_error: bool = False,
+        images: list[JSON] | None = None,
+    ) -> bool:
         if call_id not in self.pending_calls:
             return False
         self.pending_calls.pop(call_id, None)
-        await self.send(
-            {
-                "type": protocol.TOOL_RESULT,
-                "call_id": call_id,
-                "content": content,
-                "is_error": is_error,
-            }
-        )
+        message: JSON = {
+            "type": protocol.TOOL_RESULT,
+            "call_id": call_id,
+            "content": content,
+            "is_error": is_error,
+        }
+        if images:
+            message["images"] = images  # [{"data": <base64>, "mimeType": ...}]
+        await self.send(message)
         return True
 
     async def cancel(self, reason: str = "cancelled") -> None:

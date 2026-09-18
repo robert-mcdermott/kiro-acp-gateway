@@ -166,13 +166,17 @@ class BridgeServer:
         )
         result = await future
         content = str(result.get("content", ""))
-        await self._reply(
-            request_id,
-            {
-                "content": [{"type": "text", "text": content or "(no output)"}],
-                "isError": bool(result.get("is_error")),
-            },
-        )
+        blocks: list[JSON] = [{"type": "text", "text": content or "(no output)"}]
+        for image in result.get("images") or []:
+            if isinstance(image, dict) and image.get("data"):
+                blocks.append(
+                    {
+                        "type": "image",
+                        "data": image["data"],
+                        "mimeType": image.get("mimeType") or "image/png",
+                    }
+                )
+        await self._reply(request_id, {"content": blocks, "isError": bool(result.get("is_error"))})
 
 
 async def main() -> None:

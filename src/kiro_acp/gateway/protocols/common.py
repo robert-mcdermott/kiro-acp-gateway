@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import json
 import re
@@ -83,6 +84,10 @@ async def with_keepalive(
         finally:
             if pending is not None and not pending.done():
                 pending.cancel()
+                # Let the cancelled __anext__ finish unwinding before aclosing() closes the
+                # generator, otherwise "aclose(): asynchronous generator is already running".
+                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration, Exception):
+                    await pending
 
 
 def stream_error_body(message: str) -> JSON:

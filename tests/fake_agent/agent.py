@@ -13,6 +13,8 @@ Behaviour is driven by the *prompt text* so tests can request scenarios:
 * ``"/effort <level>"``       – replies ``Effort set to <level>`` (v2 style).
 * ``"refuse"``                – answers, then sends ``_kiro.dev/metadata`` with ``CONTENT_FILTERED``.
 * ``"mcp?"``                  – lists the names of the session's ``mcpServers``.
+* ``"tools?"``                – connects to the first MCP server and lists the tools it advertises.
+* ``"thought:<text>"``        – emits a thought chunk, then streams ``<text>``.
 * ``"stall"``                 – opens a tool call and goes silent until cancelled (then ``cancelled``).
 * ``"noack"``                 – ignores ``session/cancel`` for 3 s (a wedged agent).
 * ``"maxtokens"``             – ends the turn with ``max_tokens``.
@@ -302,6 +304,31 @@ class Agent:
                 await say(f"Effort set to {level}\n")
             else:
                 await say(f"invalid value '{level}' for 'output_config.effort'\n")
+            return {"stopReason": "end_turn"}
+        if text.startswith("thought:"):
+            await self.update(
+                session_id,
+                {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "considering the tools"},
+                },
+            )
+            payload = text[len("thought:") :]
+            for i in range(0, len(payload), 7):
+                await say(payload[i : i + 7])
+            await self.notify("_kiro.dev/metadata", {"sessionId": session_id, "turnDurationMs": 2})
+            return {"stopReason": "end_turn"}
+        if text == "tools?":
+            mcp_config = session.get("mcp") or []
+            if not mcp_config:
+                await say("tools: none")
+                return {"stopReason": "end_turn"}
+            client = session.get("mcp_client")
+            if client is None:
+                client = McpClient(mcp_config[0])
+                await client.start()
+                session["mcp_client"] = client
+            await say("tools: " + ", ".join(t["name"] for t in client.tools))
             return {"stopReason": "end_turn"}
         if text.startswith("mcp:") or text == "mcp2":
             mcp_config = session.get("mcp") or []
@@ -649,7 +676,15 @@ class McpClient:
 
     async def call(self, name: str, arguments: JSON) -> str:
         result = await self.request("tools/call", {"name": name, "arguments": arguments})
-        return "".join(c.get("text", "") for c in result.get("content", []) if isinstance(c, dict))
+        out = []
+        for block in result.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "image":
+                out.append(f"[image {block.get('mimeType')} {len(block.get('data', ''))}b]")
+            else:
+                out.append(block.get("text", ""))
+        return "".join(out)
 
     async def close(self) -> None:
         if self.process and self.process.returncode is None:

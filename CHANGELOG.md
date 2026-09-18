@@ -4,6 +4,34 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-09-18
+
+Fixes for the six findings of the 2026-09-18 compatibility review
+(`docs/COMPATIBILITY_REVIEW_2026-09-18.md`), each with a regression test:
+
+### Fixed
+
+- Session pool: a session displaced by another conversation with the same prefix is now
+  closed instead of orphaned, and a session blocked on tool calls is only reused by a
+  request carrying its own call ids (finding 1).
+- Responses streaming: reasoning, message, and tool-call items keep distinct, stable
+  `output_index` values with paired lifecycle events; verified with the OpenAI SDK's
+  stream assembler (finding 2).
+- MCP tool mode now enforces stop sequences and `max_tokens`, and validates structured
+  output (reported, not re-prompted) like the emulated mode (finding 3).
+- `tool_choice` is enforced: named and `allowed_tools` restrict the tools Kiro sees,
+  `required` / `any` fail with `502 tool_choice_unsatisfied` when the model answers in
+  text; both tool modes and all three APIs (finding 4).
+- SSE keepalive wrapper awaits its cancelled iterator task before closing the source,
+  removing an "asynchronous generator is already running" error on disconnect (finding 5).
+- Images in Anthropic `tool_result` blocks are delivered to Kiro as MCP image content, and
+  text sent beside tool results is forwarded (finding 6).
+
+### Added
+
+- SDK contract tests: the OpenAI and Anthropic Python SDKs' stream assemblers run against
+  the fake agent, and the tool tests cover both tool modes.
+
 ## [0.1.1] - 2026-09-18
 
 ### Fixed
@@ -75,5 +103,6 @@ OpenCode, Collomia, the OpenAI and Anthropic Python SDKs, curl, and plain `reque
   themes, an audit ledger with secret redaction, health endpoint, Docker/Podman image,
   launchd and systemd installers, GitHub Actions CI, and ready-to-use client examples.
 
+[0.1.2]: https://github.com/robert-mcdermott/kiro-acp-gateway/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/robert-mcdermott/kiro-acp-gateway/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/robert-mcdermott/kiro-acp-gateway/releases/tag/v0.1.0

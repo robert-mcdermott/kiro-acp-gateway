@@ -204,6 +204,15 @@ def parse_tool_choice(value: Any) -> ToolChoice:
     if value in ("required", "any"):
         return ToolChoice("required")
     if isinstance(value, dict):
+        if value.get("type") == "allowed_tools":
+            spec = value.get("allowed_tools") or value
+            names = [
+                str((t.get("function") or t).get("name") or "")
+                for t in spec.get("tools") or []
+                if isinstance(t, dict)
+            ]
+            mode = "required" if spec.get("mode") == "required" else "auto"
+            return ToolChoice(mode, names=[n for n in names if n])
         function = value.get("function") or value
         name = function.get("name")
         if name:
