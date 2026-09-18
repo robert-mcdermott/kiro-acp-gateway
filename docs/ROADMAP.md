@@ -113,7 +113,7 @@ estimates, keeping `usage.estimated` accurate.
 Prometheus `/metrics` (turns by mode/engine/model, latency, credits, active sessions,
 pool hits) and optional OpenTelemetry spans per turn with the Kiro session id. Propagate
 `traceparent` into ACP `_meta` per the spec's reserved keys.
-*Done (2026-09-17):* Prometheus `/metrics` with turns, latency histogram, credits, session reuse, errors, and gauges; no OpenTelemetry (no dependency wanted) and no `traceparent` propagation yet.
+*Done (2026-09-17):* Prometheus `/metrics` with turns, latency histogram, credits, session reuse, errors, and gauges; plus a self-contained live dashboard at `/dashboard` over `GET /v1/kiro/stats` (live sessions, turns, latency, credits, errors, audit feed); no OpenTelemetry (no dependency wanted) and no `traceparent` propagation yet.
 
 ### 15. Rate limiting and queue timeouts — DONE — S
 Per-key request rate limit and a bounded wait for a concurrency slot

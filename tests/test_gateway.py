@@ -1729,6 +1729,46 @@ async def test_frames_are_recorded_and_replayable(
             )
 
 
+async def test_stats_and_dashboard(client: httpx.AsyncClient) -> None:
+    await client.post(
+        "/v1/chat/completions",
+        json={"model": "x", "messages": [{"role": "user", "content": "echo: hi"}]},
+    )
+    page = await client.get("/dashboard", headers={"Authorization": ""})
+    assert page.status_code == 200 and "Kiro Gateway" in page.text
+    assert "text/html" in page.headers["content-type"]
+    denied = await client.get("/v1/kiro/stats", headers={"Authorization": ""})
+    assert denied.status_code == 401
+    stats = (await client.get("/v1/kiro/stats")).json()
+    assert stats["health"]["status"] == "ok"
+    assert stats["gauges"]["live_sessions"] == 1 and stats["gauges"]["active_turns"] == 0
+    assert stats["metrics"]["turns"][0]["finish"] == "stop"
+    assert stats["metrics"]["latency"][0]["count"] == 1
+    session = stats["sessions"][0]
+    assert session["model"] == "claude-opus-4.8" and session["busy"] is False
+    assert session["mode"] == "agent" and session["permissions"] == "allow-once"
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "echo: hi"}],
+            "tools": [READ_TOOL],
+        },
+    )
+    modes = {s["mode"]: s for s in (await client.get("/v1/kiro/stats")).json()["sessions"]}
+    assert modes["harness"]["permissions"] == "client runs tools"
+    assert stats["audit"] and stats["audit"][0]["records"] >= 2
+
+
+async def test_dashboard_can_be_disabled(workspace: Path, engine: str) -> None:
+    settings = make_settings(workspace, engine=engine, dashboard=False)
+    app = create_app(settings, backend=FakeKiroBackend(settings))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://gw") as http:
+            assert (await http.get("/dashboard")).status_code == 404
+
+
 async def test_metrics_endpoint(client: httpx.AsyncClient) -> None:
     await client.post(
         "/v1/chat/completions",
@@ -1742,7 +1782,10 @@ async def test_metrics_endpoint(client: httpx.AsyncClient) -> None:
     text = response.text
     assert 'kiro_gateway_turns_total{mode="agent"' in text and 'finish="stop"} 1' in text
     assert "kiro_gateway_turn_seconds_bucket" in text
-    assert "kiro_gateway_errors_total{" in text
+    assert (
+        'kiro_gateway_errors_total{code="invalid_messages",status="400"} 1' in text
+        or 'kiro_gateway_errors_total{code="invalid_request",status="400"} 1' in text
+    ), text
     assert "kiro_gateway_live_sessions" in text
 
     response = await client.post(

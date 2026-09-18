@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kiro Gateway</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1c1f26; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #2563eb; --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --bar: #93c5fd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1117; --panel: #171a23; --text: #e6e8ee; --muted: #9aa3b2; --line: #2a2f3d; --bar: #3b5bdb; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .status { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
+  header .spacer { flex: 1; }
+  header button, header input { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
+  main[hidden] { display: none; }
+  main { padding: 16px 20px 40px; max-width: 1400px; margin: 0 auto; display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+  .wide { grid-column: 1 / -1; }
+  .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+  .gauge { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+  .gauge .v { font-size: 26px; font-weight: 600; }
+  .gauge .l { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; }
+  .bar { height: 10px; background: var(--bar); border-radius: 3px; min-width: 2px; }
+  .barrow { display: grid; grid-template-columns: 70px 1fr 50px; align-items: center; gap: 8px; margin: 3px 0; }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+  .pill.busy { border-color: var(--warn); color: var(--warn); }
+  .pill.stop { color: var(--ok); } .pill.error, .pill.refusal { color: var(--bad); } .pill.tool_calls { color: var(--accent); }
+  #login { display: none; padding: 40px 20px; text-align: center; }
+  #login form { display: inline-flex; gap: 8px; }
+  #error { color: var(--bad); }
+  .empty { color: var(--muted); font-style: italic; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kiro Gateway</h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></div>
+  <span class="muted" id="version"></span>
+  <span class="spacer"></span>
+  <span class="muted" id="updated"></span>
+  <button id="pause" title="Pause auto-refresh">Pause</button>
+  <button id="logout" title="Forget the API key">Key</button>
+</header>
+<div id="login">
+  <p>Enter the gateway API key (<code>KIRO_GATEWAY_API_KEY</code>). It is kept in this browser only.</p>
+  <form id="loginForm"><input id="key" type="password" placeholder="gateway key" autocomplete="off" size="40"><button type="submit">Connect</button></form>
+  <p id="error"></p>
+</div>
+<main id="main" hidden>
+  <section class="panel wide">
+    <h2>Now</h2>
+    <div class="gauges" id="gauges"></div>
+    <p class="muted mono" id="settingsLine"></p>
+  </section>
+  <section class="panel wide"><h2>Live sessions</h2><div id="sessions"></div></section>
+  <section class="panel"><h2>Turns</h2><div id="turns"></div></section>
+  <section class="panel"><h2>Latency</h2><div id="latency"></div></section>
+  <section class="panel"><h2>Credits by model</h2><div id="credits"></div></section>
+  <section class="panel"><h2>Errors</h2><div id="errors"></div></section>
+  <section class="panel wide"><h2>Recent sessions (audit ledger)</h2><div id="audit"></div></section>
+</main>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const KEY_STORE = "kiro-gateway-key";
+  let key = "";
+  try { key = localStorage.getItem(KEY_STORE) || ""; } catch (e) {}
+  let paused = false, timer = null;
+
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  const fmtDur = (s) => s == null ? "" : s < 60 ? s.toFixed(0) + "s" : s < 3600 ? (s/60).toFixed(1) + "m" : (s/3600).toFixed(1) + "h";
+  const fmtTime = (t) => new Date(t * 1000).toLocaleTimeString();
+
+  function table(headers, rows, numeric) {
+    if (!rows.length) return '<p class="empty">nothing yet</p>';
+    const h = headers.map((x, i) => `<th class="${numeric && numeric.includes(i) ? "num" : ""}">${esc(x)}</th>`).join("");
+    const b = rows.map(r => "<tr>" + r.map((c, i) => `<td class="${numeric && numeric.includes(i) ? "num" : ""}">${c}</td>`).join("") + "</tr>").join("");
+    return `<table><thead><tr>${h}</tr></thead><tbody>${b}</tbody></table>`;
+  }
+
+  function render(d) {
+    const h = d.health, g = d.gauges, m = d.metrics;
+    $("dot").className = "dot " + (h.status === "ok" ? "ok" : "warn");
+    $("statusText").textContent = h.status === "ok" ? "healthy" : h.status;
+    $("version").textContent = "v" + h.version + " · " + h.backend;
+    $("updated").textContent = "updated " + fmtTime(d.time);
+    const totalTurns = m.turns.reduce((a, r) => a + r.value, 0);
+    const totalCredits = m.credits.reduce((a, r) => a + r.value, 0);
+    const totalErrors = m.errors.reduce((a, r) => a + r.value, 0);
+    const reuse = Object.fromEntries(m.session_reuse.map(r => [r.reused, r.value]));
+    const gauges = [
+      ["Active turns", g.active_turns], ["Free slots", g.queue_slots_free],
+      ["Live sessions", g.live_sessions], ["Models", g.models_cached],
+      ["Turns", totalTurns], ["Credits", totalCredits.toFixed(3)],
+      ["Errors", totalErrors], ["Session reuse", totalTurns ? Math.round(100 * (reuse.true || 0) / ((reuse.true || 0) + (reuse.false || 0))) + "%" : "–"],
+    ];
+    $("gauges").innerHTML = gauges.map(([l, v]) => `<div class="gauge"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
+    const s = d.settings;
+    $("settingsLine").textContent = `engine ${s.engine} (harness ${s.harness_engine}) · tool mode ${s.tool_mode} · permissions ${s.permissions} · default model ${s.default_model || "kiro"} · concurrency ${s.max_concurrency} · pool ${s.max_sessions} × ${fmtDur(s.session_idle_ttl)} idle · workspace ${s.workspace}` + (g.mcp_catalogue.length ? ` · MCP catalogue: ${g.mcp_catalogue.join(", ")}` : "");
+
+    $("sessions").innerHTML = table(
+      ["state", "mode", "session", "engine", "model", "agent", "workspace", "permissions", "idle", "age"],
+      d.sessions.map(x => [
+        x.busy ? '<span class="pill busy">running</span>' : (x.pending_tools ? '<span class="pill">awaiting tools</span>' : '<span class="pill">idle</span>'),
+        `<span class="pill">${esc(x.mode)}</span>`,
+        `<span class="mono">${esc(x.session_id)}</span>`, esc(x.engine), esc(x.model), esc(x.agent),
+        `<span class="mono">${x.mode === "harness" ? '<span class="muted">scratch</span>' : esc(x.workspace)}</span>`,
+        x.mode === "harness" ? `<span class="muted">${esc(x.permissions)}</span>` : esc(x.permissions),
+        fmtDur(x.idle_seconds), fmtDur(x.age_seconds)]),
+      [8, 9]);
+
+    $("turns").innerHTML = table(["mode", "engine", "model", "finish", "count"],
+      m.turns.map(r => [esc(r.mode), esc(r.engine), esc(r.model), `<span class="pill ${esc(r.finish)}">${esc(r.finish)}</span>`, r.value]), [4]);
+
+    $("latency").innerHTML = m.latency.length ? m.latency.map(l => {
+      const max = Math.max(1, ...l.buckets.map((b, i) => b.count - (i ? l.buckets[i - 1].count : 0)));
+      let prev = 0;
+      const rows = l.buckets.map(b => { const n = b.count - prev; prev = b.count;
+        return `<div class="barrow"><span class="muted mono">≤ ${b.le}s</span><div class="bar" style="width:${Math.round(100 * n / max)}%"></div><span class="num mono">${n}</span></div>`; }).join("");
+      return `<div><strong>${esc(l.mode)} · ${esc(l.model)}</strong> <span class="muted">${l.count} turns, mean ${l.mean}s</span>${rows}</div>`;
+    }).join("<hr style='border:0;border-top:1px solid var(--line)'>") : '<p class="empty">nothing yet</p>';
+
+    $("credits").innerHTML = table(["model", "credits"], m.credits.map(r => [esc(r.model), r.value.toFixed(4)]), [1]);
+    $("errors").innerHTML = table(["code", "status", "count"], m.errors.map(r => [`<span class="mono">${esc(r.code)}</span>`, r.status, r.value]), [1, 2]);
+    $("audit").innerHTML = table(["session", "last activity", "records", "kinds"],
+      d.audit.slice().reverse().map(a => [
+        `<a class="mono" href="/v1/kiro/sessions/${encodeURIComponent(a.session_id)}/audit" target="_blank" rel="noopener">${esc(a.session_id)}</a>`,
+        a.updated ? fmtTime(a.updated) : "", a.records,
+        Object.entries(a.kinds).map(([k, v]) => `<span class="pill">${esc(k)} ${v}</span>`).join(" ")]), [2]);
+  }
+
+  async function refresh() {
+    if (!key) { showLogin(""); return; }
+    try {
+      const r = await fetch("/v1/kiro/stats", { headers: { Authorization: "Bearer " + key }, cache: "no-store" });
+      if (r.status === 401) { showLogin("That key was rejected."); return; }
+      if (!r.ok) throw new Error(r.status + " " + r.statusText);
+      render(await r.json());
+      $("login").style.display = "none"; $("main").hidden = false;
+    } catch (e) {
+      $("dot").className = "dot bad"; $("statusText").textContent = "unreachable: " + e.message;
+    }
+  }
+  function showLogin(msg) { $("login").style.display = "block"; $("main").hidden = true; $("error").textContent = msg; $("dot").className = "dot"; $("statusText").textContent = "not connected"; }
+  function schedule() { clearInterval(timer); if (!paused) timer = setInterval(refresh, 4000); }
+
+  $("loginForm").addEventListener("submit", (e) => { e.preventDefault(); key = $("key").value.trim(); try { localStorage.setItem(KEY_STORE, key); } catch (x) {} refresh(); });
+  $("logout").addEventListener("click", () => { key = ""; try { localStorage.removeItem(KEY_STORE); } catch (x) {} showLogin(""); });
+  $("pause").addEventListener("click", () => { paused = !paused; $("pause").textContent = paused ? "Resume" : "Pause"; schedule(); });
+  refresh(); schedule();
+})();
+</script>
+</body>
+</html>

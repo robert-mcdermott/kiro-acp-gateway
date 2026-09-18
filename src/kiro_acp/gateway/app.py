@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from kiro_acp import __version__
 from kiro_acp.acp.errors import ACPError
@@ -174,6 +175,17 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
                 )
             return data
 
+    if settings.dashboard:
+        page = (Path(__file__).parent / "static" / "dashboard.html").read_text(encoding="utf-8")
+
+        @app.get("/dashboard", include_in_schema=False)
+        async def dashboard():
+            return HTMLResponse(page)
+
+    @app.get("/v1/kiro/stats", dependencies=[Depends(authorize)])
+    async def stats():
+        return backend.stats()
+
     if settings.metrics:
 
         @app.get("/metrics", dependencies=[Depends(authorize)])
@@ -221,6 +233,8 @@ def create_app(settings: Settings | None = None, *, backend: KiroBackend | None 
                 "/v1/messages",
                 "/v1/messages/count_tokens",
                 "/v1/models",
+                "/v1/kiro/stats",
+                "/dashboard",
                 "/health",
             ],
         }

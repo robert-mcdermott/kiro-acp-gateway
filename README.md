@@ -349,6 +349,10 @@ Errors come back with the HTTP status and body described under *Error format*; t
 | `POST /v1/messages` | Anthropic Messages (streaming and non-streaming, tools, images, thinking blocks, `output_config.effort`) |
 | `POST /v1/messages/count_tokens` | Anthropic token counting (estimated) |
 | `GET /v1/models`, `GET /v1/models/{id}` | OpenAI format by default; Anthropic format when `anthropic-version` or `x-api-key` is present |
+| `GET /v1/kiro/stats` | JSON snapshot of metrics, live sessions, and recent audit activity (feeds the dashboard) |
+| `GET /dashboard` | Live dashboard page |
+| `GET /v1/kiro/sessions`, `GET /v1/kiro/sessions/{id}/audit` | Audit ledger |
+| `GET /metrics` | Prometheus metrics |
 | `GET /health` | Gateway status |
 
 The same routes exist under `/openai/v1/...` and `/anthropic/v1/...` if a client cannot share
@@ -741,6 +745,7 @@ the working directory is also read). The most important ones:
 | `KIRO_GATEWAY_CODEX_CATALOG` | `true` | Answer Codex's `GET /v1/models?client_version=...` with a Codex model catalogue for every Kiro model. |
 | `KIRO_GATEWAY_CODEX_TOOL_MODE` | `direct` | Tool style that catalogue selects for Codex: `direct` function tools or `code` mode. |
 | `KIRO_GATEWAY_METRICS` | `true` | Serve Prometheus metrics at `/metrics` (same authentication as `/v1`). |
+| `KIRO_GATEWAY_DASHBOARD` | `true` | Serve the live dashboard at `/dashboard` (data from `/v1/kiro/stats`, which needs the key). |
 | `KIRO_GATEWAY_SERVE_FS` / `SERVE_TERMINAL` | `false` | Offer client file-system / terminal capabilities to Kiro. |
 | `KIRO_GATEWAY_DEBUG_ACP` | `false` | Log raw ACP traffic. |
 | `KIRO_GATEWAY_LOG_LEVEL` | `info` | Log level. |
@@ -841,6 +846,17 @@ Recordings can be replayed by `tests/fake_agent/replay.py` to reproduce a sessio
 Kiro; `tests/fixtures/acp_frames/` keeps scrubbed recordings of real Kiro versions as
 regression fixtures. Recordings contain prompts, tool arguments, and outputs verbatim, so
 treat them as sensitive.
+
+**Dashboard.** `http://127.0.0.1:8000/dashboard` is a single self-contained page (no
+external assets, works offline) showing what the gateway is doing right now: health,
+active turns and free slots, live sessions with model, agent, workspace and idle time,
+turns by mode/model/finish reason, latency histograms, credits per model, errors, and the
+recent sessions from the audit ledger with links to their records. It refreshes every few
+seconds and follows the system light/dark setting. The page itself is public but empty;
+it asks for the gateway key once, keeps it in the browser's local storage, and sends it on
+every request to `GET /v1/kiro/stats`, the JSON endpoint behind it (usable from scripts
+too). `KIRO_GATEWAY_DASHBOARD=false` removes the page. The numbers live in memory and
+reset when the gateway restarts; for history use Prometheus.
 
 **Metrics.** `GET /metrics` (same key as `/v1`) serves Prometheus text:
 `kiro_gateway_turns_total{mode,engine,model,finish}`, `kiro_gateway_turn_seconds`

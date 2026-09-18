@@ -55,7 +55,37 @@ class Metrics:
 
     def record_error(self, code: str, status: int) -> None:
         with self._lock:
-            self.errors[(("code", code), ("status", str(status))),] += 1
+            self.errors[(("code", code), ("status", str(status)))] += 1
+
+    def snapshot(self) -> dict:
+        """Structured form of the counters for the dashboard (``/v1/kiro/stats``)."""
+
+        def rows(table: dict) -> list[dict]:
+            return [{**dict(labels), "value": value} for labels, value in sorted(table.items())]
+
+        with self._lock:
+            latency = []
+            for labels, buckets in sorted(self.latency_buckets.items()):
+                count = self.latency_count[labels]
+                latency.append(
+                    {
+                        **dict(labels),
+                        "count": count,
+                        "sum": round(self.latency_sum[labels], 3),
+                        "mean": round(self.latency_sum[labels] / count, 3) if count else 0.0,
+                        "buckets": [
+                            {"le": bound, "count": n}
+                            for bound, n in zip(_BUCKETS, buckets, strict=True)
+                        ],
+                    }
+                )
+            return {
+                "turns": rows(self.turns),
+                "credits": rows(self.credits),
+                "session_reuse": rows(self.reuse),
+                "errors": rows(self.errors),
+                "latency": latency,
+            }
 
     def render(self, *, active_turns: int, live_sessions: int, models_cached: int) -> str:
         lines: list[str] = []

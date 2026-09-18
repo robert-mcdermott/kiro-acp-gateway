@@ -1449,6 +1449,57 @@ class KiroBackend:
             models_cached=len(self._models),
         )
 
+    def stats(self) -> JSON:
+        """Everything the dashboard shows: counters, gauges, live sessions, recent activity."""
+        now = time.monotonic()
+        sessions = []
+        harness_agents = {self.settings.harness_agent, self.settings.harness_agent_mcp}
+        for pooled in list(self._pool.values()) + list(self._active):
+            harness = pooled.bridge is not None or pooled.mode in harness_agents
+            sessions.append(
+                {
+                    "session_id": pooled.session.session_id,
+                    "engine": pooled.agent.engine,
+                    "mode": "harness" if harness else "agent",
+                    "model": pooled.session.model_id,
+                    "agent": pooled.session.mode_id,
+                    "workspace": pooled.workspace,
+                    # In harness mode the client executes tools and asks its own user; the
+                    # policy here only governs Kiro's own tools, which the harness agent lacks.
+                    "permissions": "client runs tools" if harness else pooled.permissions,
+                    "busy": pooled.busy,
+                    "pending_tools": bool(pooled.pending and pooled.pending.awaiting),
+                    "idle_seconds": round(now - pooled.last_used, 1),
+                    "age_seconds": round(now - pooled.created, 1),
+                }
+            )
+        sessions.sort(key=lambda s: (not s["busy"], s["idle_seconds"]))
+        return {
+            "health": self.health(),
+            "settings": {
+                "engine": self.settings.engine,
+                "harness_engine": self.settings.harness_engine or self.settings.engine,
+                "tool_mode": self.settings.tool_mode,
+                "workspace": self.settings.workspace,
+                "permissions": self.settings.permissions,
+                "max_concurrency": self.settings.max_concurrency,
+                "max_sessions": self.settings.max_sessions,
+                "session_idle_ttl": self.settings.session_idle_ttl,
+                "default_model": self._default_model,
+            },
+            "gauges": {
+                "active_turns": len(self._active),
+                "live_sessions": len(self._pool),
+                "models_cached": len(self._models),
+                "queue_slots_free": self._turn_slots._value,  # noqa: SLF001 - asyncio.Semaphore has no getter
+                "mcp_catalogue": sorted(self.mcp_catalogue),
+            },
+            "metrics": self.metrics.snapshot(),
+            "sessions": sessions,
+            "audit": self.audit.sessions()[-25:],
+            "time": time.time(),
+        }
+
     def health(self) -> JSON:
         return {
             "status": "ok" if self.started else "starting",

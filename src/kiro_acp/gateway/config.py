@@ -124,6 +124,10 @@ class Settings(BaseSettings):
     metrics: bool = Field(
         default=True, description="Serve Prometheus metrics at /metrics (same auth as /v1)"
     )
+    dashboard: bool = Field(
+        default=True,
+        description="Serve the live dashboard page at /dashboard (its data comes from /v1/kiro/stats, which needs the API key)",
+    )
 
     # --- HTTP ----------------------------------------------------------------
     host: str = "127.0.0.1"
