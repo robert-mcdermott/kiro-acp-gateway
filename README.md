@@ -852,7 +852,8 @@ external assets, works offline) showing what the gateway is doing right now: hea
 active turns and free slots, live sessions with model, agent, workspace and idle time,
 turns by mode/model/finish reason, latency histograms, credits per model, errors, and the
 recent sessions from the audit ledger with links to their records. It refreshes every few
-seconds and follows the system light/dark setting. The page itself is public but empty;
+seconds; a header button switches between the light (default) and dark themes and the
+choice is remembered per browser. The page itself is public but empty;
 it asks for the gateway key once, keeps it in the browser's local storage, and sends it on
 every request to `GET /v1/kiro/stats`, the JSON endpoint behind it (usable from scripts
 too). `KIRO_GATEWAY_DASHBOARD=false` removes the page. The numbers live in memory and

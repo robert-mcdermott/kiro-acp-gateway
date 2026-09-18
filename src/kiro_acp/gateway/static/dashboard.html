@@ -1,146 +1,221 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kiro Gateway</title>
 <style>
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --text: #1c1f26; --muted: #6b7280; --line: #e5e7eb;
-    --accent: #2563eb; --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --bar: #93c5fd;
+    --bg: #f3f5f8; --panel: #ffffff; --panel-2: #f8fafc; --text: #0f172a; --muted: #64748b; --line: #e2e8f0;
+    --accent: #2563eb; --accent-soft: #dbeafe; --ok: #15803d; --ok-soft: #dcfce7; --warn: #b45309; --warn-soft: #fef3c7;
+    --bad: #b91c1c; --bad-soft: #fee2e2; --bar: #3b82f6; --bar-track: #eef2f7;
+    --shadow: 0 1px 2px rgba(15, 23, 42, .06), 0 1px 3px rgba(15, 23, 42, .04);
+    --radius: 12px;
   }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #0f1117; --panel: #171a23; --text: #e6e8ee; --muted: #9aa3b2; --line: #2a2f3d; --bar: #3b5bdb; }
+  :root[data-theme="dark"] {
+    --bg: #0b0e14; --panel: #131720; --panel-2: #181d28; --text: #e5e9f0; --muted: #8b95a7; --line: #232a38;
+    --accent: #60a5fa; --accent-soft: #1e2a44; --ok: #4ade80; --ok-soft: #142a1e; --warn: #fbbf24; --warn-soft: #2f2412;
+    --bad: #f87171; --bad-soft: #341a1a; --bar: #4f7cf0; --bar-track: #1b2130;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4);
   }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
-  header { display: flex; align-items: center; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; }
-  header h1 { font-size: 16px; margin: 0; }
-  header .status { display: flex; align-items: center; gap: 8px; color: var(--muted); }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); display: inline-block; }
-  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
-  header .spacer { flex: 1; }
-  header button, header input { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
-  main[hidden] { display: none; }
-  main { padding: 16px 20px 40px; max-width: 1400px; margin: 0 auto; display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
-  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
-  .wide { grid-column: 1 / -1; }
-  .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
-  .gauge { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
-  .gauge .v { font-size: 26px; font-weight: 600; }
-  .gauge .l { color: var(--muted); font-size: 12px; }
-  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; }
-  td.num, th.num { text-align: right; }
-  .bar { height: 10px; background: var(--bar); border-radius: 3px; min-width: 2px; }
-  .barrow { display: grid; grid-template-columns: 70px 1fr 50px; align-items: center; gap: 8px; margin: 3px 0; }
+  html { color-scheme: light; }
+  :root[data-theme="dark"] { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .mono { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
   .muted { color: var(--muted); }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-  .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
-  .pill.busy { border-color: var(--warn); color: var(--warn); }
-  .pill.stop { color: var(--ok); } .pill.error, .pill.refusal { color: var(--bad); } .pill.tool_calls { color: var(--accent); }
-  #login { display: none; padding: 40px 20px; text-align: center; }
-  #login form { display: inline-flex; gap: 8px; }
-  #error { color: var(--bad); }
-  .empty { color: var(--muted); font-style: italic; }
+
+  header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line); box-shadow: var(--shadow); }
+  .bar-inner { max-width: 1440px; margin: 0 auto; padding: 0 24px; height: 56px; display: flex; align-items: center; gap: 18px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 15px; letter-spacing: -.01em; }
+  .brand .mark { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg, #6366f1, #2563eb); display: grid; place-items: center; color: #fff; font-size: 13px; font-weight: 700; }
+  .brand .sub { color: var(--muted); font-weight: 450; font-size: 13px; margin-left: 2px; }
+  .status { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px 4px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); font-size: 12.5px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); } .dot.bad { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-soft); } .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+  .spacer { flex: 1; }
+  .btn { font: inherit; font-size: 13px; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .btn:hover { background: var(--panel-2); }
+  .btn.icon { padding: 6px 8px; }
+  .btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  #updated { font-size: 12.5px; }
+
+  main { max-width: 1440px; margin: 0 auto; padding: 22px 24px 48px; display: grid; gap: 18px; grid-template-columns: repeat(12, 1fr); }
+  main[hidden] { display: none; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px 18px; min-width: 0; grid-column: span 6; }
+  .panel.wide { grid-column: 1 / -1; }
+  .panel.third { grid-column: span 4; }
+  @media (max-width: 1100px) { .panel, .panel.third { grid-column: 1 / -1; } }
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  .panel h2 { font-size: 12.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; }
+  .panel .hint { font-size: 12px; color: var(--muted); }
+
+  .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .gauge { padding: 12px 14px; border-radius: 10px; background: var(--panel-2); border: 1px solid var(--line); }
+  .gauge .v { font-size: 28px; font-weight: 650; letter-spacing: -.02em; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .gauge .l { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .gauge.accent .v { color: var(--accent); } .gauge.warn .v { color: var(--warn); } .gauge.bad .v { color: var(--bad); }
+  .settings { margin: 14px 0 0; display: flex; flex-wrap: wrap; gap: 6px 8px; }
+  .kv { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); }
+  .kv b { color: var(--text); font-weight: 550; }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 8px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  thead th { color: var(--muted); font-weight: 550; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--line); }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--panel-2); }
+  td.num, th.num { text-align: right; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 550; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+  .pill.busy { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+  .pill.ok, .pill.stop { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
+  .pill.error, .pill.refusal, .pill.cancelled { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+  .pill.tool_calls, .pill.harness { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+
+  .hist { display: grid; gap: 4px; }
+  .hist .title { display: flex; justify-content: space-between; align-items: baseline; margin: 6px 0 4px; }
+  .hist .title b { font-weight: 600; }
+  .barrow { display: grid; grid-template-columns: 62px 1fr 44px; align-items: center; gap: 10px; }
+  .track { height: 8px; background: var(--bar-track); border-radius: 999px; overflow: hidden; }
+  .fill { height: 100%; background: var(--bar); border-radius: 999px; transition: width .4s ease; }
+  .empty { color: var(--muted); font-style: italic; padding: 6px 0; }
+
+  #login { display: none; max-width: 420px; margin: 80px auto; padding: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); text-align: center; }
+  #login h3 { margin: 0 0 6px; font-size: 16px; }
+  #login p { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+  #login form { display: flex; gap: 8px; }
+  #login input { flex: 1; font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); color: var(--text); }
+  #login input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  .btn.primary { background: var(--accent); color: #fff; border-color: transparent; }
+  .btn.primary:hover { filter: brightness(1.05); }
+  #error { color: var(--bad); font-size: 13px; margin-top: 10px; min-height: 1em; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Kiro Gateway</h1>
-  <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></div>
-  <span class="muted" id="version"></span>
-  <span class="spacer"></span>
-  <span class="muted" id="updated"></span>
-  <button id="pause" title="Pause auto-refresh">Pause</button>
-  <button id="logout" title="Forget the API key">Key</button>
+  <div class="bar-inner">
+    <div class="brand"><span class="mark">K</span>Kiro Gateway <span class="sub" id="version"></span></div>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></div>
+    <span class="spacer"></span>
+    <span class="muted" id="updated"></span>
+    <button class="btn" id="pause" title="Pause auto-refresh">Pause</button>
+    <button class="btn icon" id="theme" title="Toggle light / dark theme" aria-label="Toggle theme">
+      <svg id="iconMoon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      <svg id="iconSun" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4m11.4-11.4 1.4-1.4"/></svg>
+    </button>
+    <button class="btn" id="logout" title="Forget the stored API key">Sign out</button>
+  </div>
 </header>
+
 <div id="login">
-  <p>Enter the gateway API key (<code>KIRO_GATEWAY_API_KEY</code>). It is kept in this browser only.</p>
-  <form id="loginForm"><input id="key" type="password" placeholder="gateway key" autocomplete="off" size="40"><button type="submit">Connect</button></form>
-  <p id="error"></p>
+  <h3>Connect to the gateway</h3>
+  <p>Enter the API key configured as <code>KIRO_GATEWAY_API_KEY</code>. It is stored in this browser only and sent as a bearer token to <code>/v1/kiro/stats</code>.</p>
+  <form id="loginForm"><input id="key" type="password" placeholder="Gateway API key" autocomplete="off"><button class="btn primary" type="submit">Connect</button></form>
+  <div id="error"></div>
 </div>
+
 <main id="main" hidden>
   <section class="panel wide">
-    <h2>Now</h2>
+    <div class="panel-head"><h2>Now</h2><span class="hint">in-memory counters since the gateway started</span></div>
     <div class="gauges" id="gauges"></div>
-    <p class="muted mono" id="settingsLine"></p>
+    <div class="settings" id="settingsLine"></div>
   </section>
-  <section class="panel wide"><h2>Live sessions</h2><div id="sessions"></div></section>
-  <section class="panel"><h2>Turns</h2><div id="turns"></div></section>
-  <section class="panel"><h2>Latency</h2><div id="latency"></div></section>
-  <section class="panel"><h2>Credits by model</h2><div id="credits"></div></section>
-  <section class="panel"><h2>Errors</h2><div id="errors"></div></section>
-  <section class="panel wide"><h2>Recent sessions (audit ledger)</h2><div id="audit"></div></section>
+  <section class="panel wide"><div class="panel-head"><h2>Live sessions</h2><span class="hint" id="sessionsHint"></span></div><div id="sessions"></div></section>
+  <section class="panel"><div class="panel-head"><h2>Turns</h2><span class="hint">by mode, model and finish reason</span></div><div id="turns"></div></section>
+  <section class="panel"><div class="panel-head"><h2>Latency</h2><span class="hint">turn duration, seconds</span></div><div id="latency"></div></section>
+  <section class="panel"><div class="panel-head"><h2>Credits by model</h2><span class="hint">as metered by Kiro</span></div><div id="credits"></div></section>
+  <section class="panel"><div class="panel-head"><h2>Errors</h2><span class="hint">API errors by code</span></div><div id="errors"></div></section>
+  <section class="panel wide"><div class="panel-head"><h2>Recent sessions</h2><span class="hint">from the audit ledger; open a session for its records</span></div><div id="audit"></div></section>
 </main>
+
 <script>
 (function () {
   const $ = (id) => document.getElementById(id);
-  const KEY_STORE = "kiro-gateway-key";
-  let key = "";
+  const KEY_STORE = "kiro-gateway-key", THEME_STORE = "kiro-gateway-theme";
+  let key = "", paused = false, timer = null;
   try { key = localStorage.getItem(KEY_STORE) || ""; } catch (e) {}
-  let paused = false, timer = null;
+
+  // ---- theme (light by default, remembered per browser)
+  function applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    $("iconMoon").style.display = t === "dark" ? "none" : "";
+    $("iconSun").style.display = t === "dark" ? "" : "none";
+    try { localStorage.setItem(THEME_STORE, t); } catch (e) {}
+  }
+  let theme = "light";
+  try { theme = localStorage.getItem(THEME_STORE) || "light"; } catch (e) {}
+  applyTheme(theme);
+  $("theme").addEventListener("click", () => applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark"));
 
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
   const fmtDur = (s) => s == null ? "" : s < 60 ? s.toFixed(0) + "s" : s < 3600 ? (s/60).toFixed(1) + "m" : (s/3600).toFixed(1) + "h";
   const fmtTime = (t) => new Date(t * 1000).toLocaleTimeString();
+  const shortId = (id) => { const s = String(id); return s.length > 22 ? s.slice(0, 14) + "…" + s.slice(-6) : s; };
 
   function table(headers, rows, numeric) {
-    if (!rows.length) return '<p class="empty">nothing yet</p>';
-    const h = headers.map((x, i) => `<th class="${numeric && numeric.includes(i) ? "num" : ""}">${esc(x)}</th>`).join("");
-    const b = rows.map(r => "<tr>" + r.map((c, i) => `<td class="${numeric && numeric.includes(i) ? "num" : ""}">${c}</td>`).join("") + "</tr>").join("");
+    if (!rows.length) return '<p class="empty">Nothing yet.</p>';
+    const cls = (i) => (numeric && numeric.includes(i)) ? ' class="num"' : "";
+    const h = headers.map((x, i) => `<th${cls(i)}>${esc(x)}</th>`).join("");
+    const b = rows.map(r => "<tr>" + r.map((c, i) => `<td${cls(i)}>${c}</td>`).join("") + "</tr>").join("");
     return `<table><thead><tr>${h}</tr></thead><tbody>${b}</tbody></table>`;
   }
+  const kv = (k, v) => `<span class="kv">${esc(k)} <b>${esc(v)}</b></span>`;
 
   function render(d) {
-    const h = d.health, g = d.gauges, m = d.metrics;
+    const h = d.health, g = d.gauges, m = d.metrics, s = d.settings;
     $("dot").className = "dot " + (h.status === "ok" ? "ok" : "warn");
-    $("statusText").textContent = h.status === "ok" ? "healthy" : h.status;
-    $("version").textContent = "v" + h.version + " · " + h.backend;
-    $("updated").textContent = "updated " + fmtTime(d.time);
+    $("statusText").textContent = h.status === "ok" ? "Healthy" : h.status;
+    $("version").textContent = "v" + h.version;
+    $("updated").textContent = "Updated " + fmtTime(d.time);
+
     const totalTurns = m.turns.reduce((a, r) => a + r.value, 0);
     const totalCredits = m.credits.reduce((a, r) => a + r.value, 0);
     const totalErrors = m.errors.reduce((a, r) => a + r.value, 0);
     const reuse = Object.fromEntries(m.session_reuse.map(r => [r.reused, r.value]));
+    const reusePct = (reuse.true || 0) + (reuse.false || 0) ? Math.round(100 * (reuse.true || 0) / ((reuse.true || 0) + (reuse.false || 0))) + "%" : "–";
     const gauges = [
-      ["Active turns", g.active_turns], ["Free slots", g.queue_slots_free],
-      ["Live sessions", g.live_sessions], ["Models", g.models_cached],
-      ["Turns", totalTurns], ["Credits", totalCredits.toFixed(3)],
-      ["Errors", totalErrors], ["Session reuse", totalTurns ? Math.round(100 * (reuse.true || 0) / ((reuse.true || 0) + (reuse.false || 0))) + "%" : "–"],
+      ["Active turns", g.active_turns, g.active_turns ? "accent" : ""],
+      ["Free slots", g.queue_slots_free, g.queue_slots_free === 0 ? "warn" : ""],
+      ["Live sessions", g.live_sessions, ""], ["Models", g.models_cached, ""],
+      ["Turns", totalTurns, ""], ["Credits", totalCredits.toFixed(3), ""],
+      ["Errors", totalErrors, totalErrors ? "bad" : ""], ["Session reuse", reusePct, ""],
     ];
-    $("gauges").innerHTML = gauges.map(([l, v]) => `<div class="gauge"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
-    const s = d.settings;
-    $("settingsLine").textContent = `engine ${s.engine} (harness ${s.harness_engine}) · tool mode ${s.tool_mode} · permissions ${s.permissions} · default model ${s.default_model || "kiro"} · concurrency ${s.max_concurrency} · pool ${s.max_sessions} × ${fmtDur(s.session_idle_ttl)} idle · workspace ${s.workspace}` + (g.mcp_catalogue.length ? ` · MCP catalogue: ${g.mcp_catalogue.join(", ")}` : "");
+    $("gauges").innerHTML = gauges.map(([l, v, c]) => `<div class="gauge ${c}"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
+    $("settingsLine").innerHTML = [
+      kv("engine", s.engine), kv("harness engine", s.harness_engine), kv("tool mode", s.tool_mode),
+      kv("permissions", s.permissions), kv("default model", s.default_model || "kiro"),
+      kv("concurrency", s.max_concurrency), kv("session pool", `${s.max_sessions} × ${fmtDur(s.session_idle_ttl)} idle`),
+      kv("workspace", s.workspace), ...(g.mcp_catalogue.length ? [kv("MCP catalogue", g.mcp_catalogue.join(", "))] : []),
+    ].join("");
 
+    $("sessionsHint").textContent = d.sessions.length ? `${d.sessions.length} Kiro process${d.sessions.length === 1 ? "" : "es"} kept for reuse` : "";
     $("sessions").innerHTML = table(
-      ["state", "mode", "session", "engine", "model", "agent", "workspace", "permissions", "idle", "age"],
+      ["State", "Mode", "Session", "Engine", "Model", "Agent", "Workspace", "Permissions", "Idle", "Age"],
       d.sessions.map(x => [
-        x.busy ? '<span class="pill busy">running</span>' : (x.pending_tools ? '<span class="pill">awaiting tools</span>' : '<span class="pill">idle</span>'),
-        `<span class="pill">${esc(x.mode)}</span>`,
-        `<span class="mono">${esc(x.session_id)}</span>`, esc(x.engine), esc(x.model), esc(x.agent),
-        `<span class="mono">${x.mode === "harness" ? '<span class="muted">scratch</span>' : esc(x.workspace)}</span>`,
+        x.busy ? '<span class="pill busy">Running</span>' : (x.pending_tools ? '<span class="pill">Awaiting tools</span>' : '<span class="pill">Idle</span>'),
+        `<span class="pill ${x.mode === "harness" ? "harness" : ""}">${esc(x.mode)}</span>`,
+        `<span class="mono" title="${esc(x.session_id)}">${esc(shortId(x.session_id))}</span>`, esc(x.engine), esc(x.model), esc(x.agent),
+        x.mode === "harness" ? '<span class="muted">scratch (client project)</span>' : `<span class="mono">${esc(x.workspace)}</span>`,
         x.mode === "harness" ? `<span class="muted">${esc(x.permissions)}</span>` : esc(x.permissions),
         fmtDur(x.idle_seconds), fmtDur(x.age_seconds)]),
       [8, 9]);
 
-    $("turns").innerHTML = table(["mode", "engine", "model", "finish", "count"],
+    $("turns").innerHTML = table(["Mode", "Engine", "Model", "Finish", "Count"],
       m.turns.map(r => [esc(r.mode), esc(r.engine), esc(r.model), `<span class="pill ${esc(r.finish)}">${esc(r.finish)}</span>`, r.value]), [4]);
 
     $("latency").innerHTML = m.latency.length ? m.latency.map(l => {
-      const max = Math.max(1, ...l.buckets.map((b, i) => b.count - (i ? l.buckets[i - 1].count : 0)));
       let prev = 0;
-      const rows = l.buckets.map(b => { const n = b.count - prev; prev = b.count;
-        return `<div class="barrow"><span class="muted mono">≤ ${b.le}s</span><div class="bar" style="width:${Math.round(100 * n / max)}%"></div><span class="num mono">${n}</span></div>`; }).join("");
-      return `<div><strong>${esc(l.mode)} · ${esc(l.model)}</strong> <span class="muted">${l.count} turns, mean ${l.mean}s</span>${rows}</div>`;
-    }).join("<hr style='border:0;border-top:1px solid var(--line)'>") : '<p class="empty">nothing yet</p>';
+      const counts = l.buckets.map(b => { const n = b.count - prev; prev = b.count; return { le: b.le, n }; });
+      const max = Math.max(1, ...counts.map(c => c.n));
+      const rows = counts.map(c => `<div class="barrow"><span class="muted mono">≤ ${c.le}s</span><div class="track"><div class="fill" style="width:${Math.round(100 * c.n / max)}%"></div></div><span class="num mono">${c.n}</span></div>`).join("");
+      return `<div class="hist"><div class="title"><b>${esc(l.mode)} · ${esc(l.model)}</b><span class="muted">${l.count} turn${l.count === 1 ? "" : "s"}, mean ${l.mean}s</span></div>${rows}</div>`;
+    }).join("") : '<p class="empty">Nothing yet.</p>';
 
-    $("credits").innerHTML = table(["model", "credits"], m.credits.map(r => [esc(r.model), r.value.toFixed(4)]), [1]);
-    $("errors").innerHTML = table(["code", "status", "count"], m.errors.map(r => [`<span class="mono">${esc(r.code)}</span>`, r.status, r.value]), [1, 2]);
-    $("audit").innerHTML = table(["session", "last activity", "records", "kinds"],
+    $("credits").innerHTML = table(["Model", "Credits"], m.credits.map(r => [esc(r.model), r.value.toFixed(4)]), [1]);
+    $("errors").innerHTML = table(["Code", "Status", "Count"], m.errors.map(r => [`<span class="mono">${esc(r.code)}</span>`, r.status, r.value]), [1, 2]);
+    $("audit").innerHTML = table(["Session", "Last activity", "Records", "Activity"],
       d.audit.slice().reverse().map(a => [
-        `<a class="mono" href="/v1/kiro/sessions/${encodeURIComponent(a.session_id)}/audit" target="_blank" rel="noopener">${esc(a.session_id)}</a>`,
+        `<a class="mono" href="/v1/kiro/sessions/${encodeURIComponent(a.session_id)}/audit" target="_blank" rel="noopener" title="${esc(a.session_id)}">${esc(shortId(a.session_id))}</a>`,
         a.updated ? fmtTime(a.updated) : "", a.records,
         Object.entries(a.kinds).map(([k, v]) => `<span class="pill">${esc(k)} ${v}</span>`).join(" ")]), [2]);
   }
@@ -154,10 +229,10 @@
       render(await r.json());
       $("login").style.display = "none"; $("main").hidden = false;
     } catch (e) {
-      $("dot").className = "dot bad"; $("statusText").textContent = "unreachable: " + e.message;
+      $("dot").className = "dot bad"; $("statusText").textContent = "Unreachable: " + e.message;
     }
   }
-  function showLogin(msg) { $("login").style.display = "block"; $("main").hidden = true; $("error").textContent = msg; $("dot").className = "dot"; $("statusText").textContent = "not connected"; }
+  function showLogin(msg) { $("login").style.display = "block"; $("main").hidden = true; $("error").textContent = msg; $("dot").className = "dot"; $("statusText").textContent = "Not connected"; }
   function schedule() { clearInterval(timer); if (!paused) timer = setInterval(refresh, 4000); }
 
   $("loginForm").addEventListener("submit", (e) => { e.preventDefault(); key = $("key").value.trim(); try { localStorage.setItem(KEY_STORE, key); } catch (x) {} refresh(); });
