@@ -941,7 +941,6 @@ src/kiro_acp/
 tests/
   fake_agent/  scripted ACP agent used by the test suite
 docs/          design notes
-legacy/        the original proof-of-concept scripts (kept for reference)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design,
