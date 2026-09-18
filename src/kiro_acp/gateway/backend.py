@@ -661,11 +661,18 @@ class KiroBackend:
     # ---------------------------------------------------------------- session selection
 
     async def _acquire(
-        self, conversation: Conversation, opts: TurnOptions, permissions: str
+        self,
+        conversation: Conversation,
+        opts: TurnOptions,
+        permissions: str,
+        tools: list[ToolDef] | None = None,
     ) -> tuple[PooledSession, int, bool]:
-        """Return ``(pooled, start_index, fresh)``."""
+        """Return ``(pooled, start_index, fresh)``. ``tools`` are the ones the model may see
+        (after ``tool_choice`` restrictions); the pool keys on that set."""
+        if tools is None:
+            tools = conversation.tools
         signature = (
-            tools_signature(conversation.tools)
+            tools_signature(tools)
             if opts.emulate_tools and self.settings.tool_mode == "mcp"
             else ""
         )
@@ -674,11 +681,14 @@ class KiroBackend:
             start = conversation.prefix_length_for_affinity()
             if start > 0:
                 key = conversation.fingerprint(start)
+                wanted = {r.call_id for m in conversation.messages[start:] for r in m.tool_results}
                 async with self._pool_lock:
                     pooled = self._pool.get(key)
                     if (
                         pooled is not None
                         and not pooled.busy
+                        # A session blocked on tool calls only continues with its own results.
+                        and (pooled.pending is None or bool(wanted & set(pooled.pending.awaiting)))
                         and pooled.model == opts.model
                         and pooled.mode == opts.agent
                         and pooled.permissions == permissions
@@ -695,7 +705,7 @@ class KiroBackend:
                             "Reusing session %s for prefix %s", pooled.session.session_id, key[:12]
                         )
                         return pooled, start, False
-        pooled = await self._spawn(opts, permissions, conversation.tools if signature else None)
+        pooled = await self._spawn(opts, permissions, tools if signature else None)
         pooled.busy = True
         return pooled, 0, True
 
@@ -710,6 +720,11 @@ class KiroBackend:
         pooled.fingerprint = fingerprint
         evicted: list[PooledSession] = []
         async with self._pool_lock:
+            displaced = self._pool.get(fingerprint)
+            if displaced is not None and displaced is not pooled:
+                # Two conversations with the same prefix (a client retry, a fan-out of the
+                # same prompt): keep one, close the other instead of orphaning its process.
+                evicted.append(displaced)
             self._pool[fingerprint] = pooled
             while len(self._pool) > self.settings.max_sessions:
                 oldest_key = min(self._pool, key=lambda k: self._pool[k].last_used)
@@ -810,7 +825,8 @@ class KiroBackend:
                 retry_after=max(1, int(self.settings.queue_timeout)),
             ) from error
         try:
-            pooled, start, fresh = await self._acquire(conversation, opts, permissions)
+            exposed = conversation.tool_choice.exposed(conversation.tools)
+            pooled, start, fresh = await self._acquire(conversation, opts, permissions, exposed)
             self._active.add(pooled)
             if (
                 opts.emulate_tools
@@ -998,6 +1014,13 @@ class KiroBackend:
                     if errors:
                         kiro_meta["schema_errors"] = errors[:5]
                 usage = self._usage(conversation, text, thoughts, calls)
+                if (
+                    opts.emulate_tools
+                    and not calls
+                    and finish == "stop"
+                    and conversation.tool_choice.must_call
+                ):
+                    raise tool_choice_unsatisfied(conversation)
                 fingerprint = None
                 if completed and error is None and finish in ("stop", "tool_calls"):
                     fingerprint = conversation.fingerprint_after(assistant_message(text, calls))
@@ -1056,6 +1079,10 @@ class KiroBackend:
         }
         if self.audit.enabled:
             kiro_meta["audit"] = f"/v1/kiro/sessions/{session.session_id}/audit"
+        limiter = StreamLimiter(
+            stop_sequences=[seq for seq in opts.stop_sequences if seq],
+            max_tokens=opts.max_tokens if self.settings.enforce_max_tokens else None,
+        )
         self.audit.record(
             session.session_id,
             "turn",
@@ -1081,15 +1108,24 @@ class KiroBackend:
         if pending is not None:
             # Continuation: hand the client's tool results to the blocked MCP calls.
             results = [r for m in new_messages for r in m.tool_results]
+            # Text the client sent along with the results: a plain user message, or text
+            # blocks beside Anthropic tool_result blocks (which land in a tool-role message).
             extra_text = "\n\n".join(
-                m.text().strip() for m in new_messages if m.role == "user" and m.text().strip()
+                m.text().strip()
+                for m in new_messages
+                if m.role in ("user", "tool") and m.text().strip()
             )
             delivered = 0
             for result in results:
                 content = result.content
                 if extra_text and result is results[-1]:
                     content += f"\n\n[User message]: {extra_text}"
-                if await pending.deliver(result.call_id, content, is_error=result.is_error):
+                images = [
+                    {"data": img.data_base64, "mimeType": img.mime_type} for img in result.images
+                ]
+                if await pending.deliver(
+                    result.call_id, content, is_error=result.is_error, images=images or None
+                ):
                     delivered += 1
                 else:
                     LOG.warning(
@@ -1155,8 +1191,20 @@ class KiroBackend:
                     case TextDelta(text=chunk):
                         # With native calls the model is blocked until results return, so any
                         # text seen now was produced before the call; keep it.
-                        text_parts.append(chunk)
-                        yield OutputText(chunk)
+                        if limiter.hit:
+                            continue
+                        if limiter.active:
+                            chunk = limiter.feed(chunk)
+                        if chunk:
+                            text_parts.append(chunk)
+                            yield OutputText(chunk)
+                        if limiter.hit:
+                            # Stop sequence or token limit reached: end the Kiro turn now.
+                            await pending.cancel("output limit reached")
+                            pooled.pending = None
+                            finish = "stop" if limiter.hit == "stop" else "length"
+                            completed = True
+                            break
                     case ThoughtDelta(text=chunk):
                         if self.settings.expose_thoughts:
                             thought_parts.append(chunk)
@@ -1196,8 +1244,23 @@ class KiroBackend:
                 yield OutputToolCall(part)
             if calls:
                 finish = "tool_calls"
+            elif limiter.active and not limiter.hit:
+                tail = limiter.flush()
+                if tail:
+                    text_parts.append(tail)
+                    yield OutputText(tail)
             text = "".join(text_parts).rstrip() if calls else "".join(text_parts)
             thoughts = "".join(thought_parts)
+            if conversation.json_output is not None and not calls and finish in ("stop", "length"):
+                # Same validation as the regular path; no re-prompt here because the
+                # session is shared with an open tool loop.
+                text = strip_json_fences(text)
+                valid, errors = validate_json_reply(text, conversation.json_output.schema)
+                kiro_meta["schema_valid"] = valid
+                if errors:
+                    kiro_meta["schema_errors"] = errors[:5]
+            if not calls and finish == "stop" and conversation.tool_choice.must_call:
+                raise tool_choice_unsatisfied(conversation)
             usage = self._usage(conversation, text, thoughts, calls)
             if completed:
                 pooled.pending = None
@@ -1544,6 +1607,21 @@ def map_stop(stop: StopReason, error: str | None, has_calls: bool) -> tuple[str,
     if stop in (StopReason.MAX_TOKENS, StopReason.MAX_TURN_REQUESTS):
         return "length", None
     return ("tool_calls" if has_calls else "stop"), None
+
+
+def tool_choice_unsatisfied(conversation: Conversation) -> GatewayError:
+    choice = conversation.tool_choice
+    wanted = (
+        f"the tool {choice.name!r}"
+        if choice.mode == "named"
+        else "one of " + ", ".join(t.name for t in choice.exposed(conversation.tools))
+    )
+    return GatewayError(
+        f"tool_choice required {wanted} but the model answered with text instead",
+        status=502,
+        error_type="api_error",
+        code="tool_choice_unsatisfied",
+    )
 
 
 def image_capable(agent: KiroAgent) -> bool:

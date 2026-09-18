@@ -135,6 +135,13 @@ def render_prompt(
     sections.append("<conversation>\n" + note + "\n".join(rendered) + "\n</conversation>")
     if emulate_tools and conversation.tools and conversation.tool_choice.mode != "none":
         sections.append(tool_reminder(conversation.tools))
+    elif not emulate_tools and conversation.tools and conversation.tool_choice.must_call:
+        exposed = conversation.tool_choice.exposed(conversation.tools)
+        names = ", ".join(t.name for t in exposed) or "the available tool"
+        sections.append(
+            "<tool_requirement>The client requires a tool call in this turn: call "
+            f"{names} rather than answering in text.</tool_requirement>"
+        )
     text = "\n\n".join(section for section in sections if section)
     if text:
         blocks.append(text_block(text))

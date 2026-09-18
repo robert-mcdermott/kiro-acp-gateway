@@ -212,8 +212,14 @@ def parse_tool_choice(value: Any) -> ToolChoice:
         return ToolChoice("required")
     if isinstance(value, dict) and value.get("type") == "function" and value.get("name"):
         return ToolChoice("named", str(value["name"]))
-    if isinstance(value, dict) and value.get("type") in ("allowed_tools",):
-        return ToolChoice("auto")
+    if isinstance(value, dict) and value.get("type") == "allowed_tools":
+        names = [
+            str(t.get("name") or (t.get("function") or {}).get("name") or "")
+            for t in value.get("tools") or []
+            if isinstance(t, dict)
+        ]
+        mode = "required" if value.get("mode") == "required" else "auto"
+        return ToolChoice(mode, names=[n for n in names if n])
     raise GatewayError("Invalid tool_choice", code="invalid_tool_choice")
 
 
@@ -488,6 +494,13 @@ def finalize(
 async def stream_response(
     backend: KiroBackend, conversation: Conversation, opts: TurnOptions, response: JSON, store: bool
 ) -> AsyncIterator[str]:
+    """Responses SSE stream.
+
+    Every output item gets its own ``output_index`` when it is opened and keeps it until
+    its ``response.output_item.done``; a reasoning item, a message item and tool-call items
+    never share an index even when they interleave, so SDK stream assemblers that key on
+    the index rebuild the same output the final response reports.
+    """
     seq = 0
 
     def emit(event_type: str, **payload: Any) -> str:
@@ -498,14 +511,74 @@ async def stream_response(
 
     yield emit("response.created", response=response)
     yield emit("response.in_progress", response=response)
-    output_index = 0
+    next_index = 0
     text = ""
     thoughts = ""
     calls: list[ToolCallPart] = []
     msg_id: str | None = None
+    msg_index = 0
     rs_id: str | None = None
+    rs_index = 0
     expose_thoughts = backend.settings.expose_thoughts
     custom = custom_tool_names(conversation)
+
+    def close_reasoning() -> list[str]:
+        nonlocal rs_id
+        if rs_id is None:
+            return []
+        out = [
+            emit(
+                "response.reasoning_summary_text.done",
+                item_id=rs_id,
+                output_index=rs_index,
+                summary_index=0,
+                text=thoughts,
+            ),
+            emit(
+                "response.reasoning_summary_part.done",
+                item_id=rs_id,
+                output_index=rs_index,
+                summary_index=0,
+                part={"type": "summary_text", "text": thoughts},
+            ),
+            emit(
+                "response.output_item.done",
+                output_index=rs_index,
+                item=reasoning_item(rs_id, thoughts),
+            ),
+        ]
+        response["output"].append(reasoning_item(rs_id, thoughts))
+        rs_id = None
+        return out
+
+    def close_message() -> list[str]:
+        nonlocal msg_id
+        if msg_id is None:
+            return []
+        out = [
+            emit(
+                "response.output_text.done",
+                item_id=msg_id,
+                output_index=msg_index,
+                content_index=0,
+                text=text,
+                logprobs=[],
+            ),
+            emit(
+                "response.content_part.done",
+                item_id=msg_id,
+                output_index=msg_index,
+                content_index=0,
+                part={"type": "output_text", "text": text, "annotations": []},
+            ),
+            emit(
+                "response.output_item.done", output_index=msg_index, item=message_item(msg_id, text)
+            ),
+        ]
+        response["output"].append(message_item(msg_id, text))
+        msg_id = None
+        return out
+
     try:
         async with aclosing(backend.run(conversation, opts)) as events:
             async for event in events:
@@ -515,15 +588,17 @@ async def stream_response(
                             continue
                         if rs_id is None:
                             rs_id = new_id("rs_")
+                            rs_index = next_index
+                            next_index += 1
                             yield emit(
                                 "response.output_item.added",
-                                output_index=output_index,
+                                output_index=rs_index,
                                 item=reasoning_item(rs_id, ""),
                             )
                             yield emit(
                                 "response.reasoning_summary_part.added",
                                 item_id=rs_id,
-                                output_index=output_index,
+                                output_index=rs_index,
                                 summary_index=0,
                                 part={"type": "summary_text", "text": ""},
                             )
@@ -531,47 +606,28 @@ async def stream_response(
                         yield emit(
                             "response.reasoning_summary_text.delta",
                             item_id=rs_id,
-                            output_index=output_index,
+                            output_index=rs_index,
                             summary_index=0,
                             delta=chunk,
                         )
                     case OutputText(text=chunk):
                         if not chunk:
                             continue
-                        if rs_id is not None:
-                            yield emit(
-                                "response.reasoning_summary_text.done",
-                                item_id=rs_id,
-                                output_index=output_index,
-                                summary_index=0,
-                                text=thoughts,
-                            )
-                            yield emit(
-                                "response.reasoning_summary_part.done",
-                                item_id=rs_id,
-                                output_index=output_index,
-                                summary_index=0,
-                                part={"type": "summary_text", "text": thoughts},
-                            )
-                            yield emit(
-                                "response.output_item.done",
-                                output_index=output_index,
-                                item=reasoning_item(rs_id, thoughts),
-                            )
-                            response["output"].append(reasoning_item(rs_id, thoughts))
-                            rs_id = None
-                            output_index += 1
+                        for line in close_reasoning():
+                            yield line
                         if msg_id is None:
                             msg_id = new_id("msg_")
+                            msg_index = next_index
+                            next_index += 1
                             yield emit(
                                 "response.output_item.added",
-                                output_index=output_index,
+                                output_index=msg_index,
                                 item=message_item(msg_id, "", "in_progress"),
                             )
                             yield emit(
                                 "response.content_part.added",
                                 item_id=msg_id,
-                                output_index=output_index,
+                                output_index=msg_index,
                                 content_index=0,
                                 part={"type": "output_text", "text": "", "annotations": []},
                             )
@@ -579,129 +635,75 @@ async def stream_response(
                         yield emit(
                             "response.output_text.delta",
                             item_id=msg_id,
-                            output_index=output_index,
+                            output_index=msg_index,
                             content_index=0,
                             delta=chunk,
                             logprobs=[],
                         )
                     case OutputToolCall(call=call):
-                        if msg_id is not None:
-                            yield emit(
-                                "response.output_text.done",
-                                item_id=msg_id,
-                                output_index=output_index,
-                                content_index=0,
-                                text=text,
-                                logprobs=[],
-                            )
-                            yield emit(
-                                "response.content_part.done",
-                                item_id=msg_id,
-                                output_index=output_index,
-                                content_index=0,
-                                part={"type": "output_text", "text": text, "annotations": []},
-                            )
-                            yield emit(
-                                "response.output_item.done",
-                                output_index=output_index,
-                                item=message_item(msg_id, text),
-                            )
-                            response["output"].append(message_item(msg_id, text))
-                            msg_id = None
-                            output_index += 1
+                        for line in close_reasoning():
+                            yield line
+                        for line in close_message():
+                            yield line
                         calls.append(call)
+                        index = next_index
+                        next_index += 1
                         if call.name in custom:
                             ctc_id = new_id("ctc_")
                             raw_input = custom_input(call)
                             yield emit(
                                 "response.output_item.added",
-                                output_index=output_index,
+                                output_index=index,
                                 item={**custom_item(ctc_id, call, "in_progress"), "input": ""},
                             )
                             yield emit(
                                 "response.custom_tool_call_input.delta",
                                 item_id=ctc_id,
-                                output_index=output_index,
+                                output_index=index,
                                 delta=raw_input,
                             )
                             yield emit(
                                 "response.custom_tool_call_input.done",
                                 item_id=ctc_id,
-                                output_index=output_index,
+                                output_index=index,
                                 input=raw_input,
                             )
                             yield emit(
                                 "response.output_item.done",
-                                output_index=output_index,
+                                output_index=index,
                                 item=custom_item(ctc_id, call),
                             )
                             response["output"].append(custom_item(ctc_id, call))
-                            output_index += 1
                             continue
                         fc_id = new_id("fc_")
                         yield emit(
                             "response.output_item.added",
-                            output_index=output_index,
+                            output_index=index,
                             item={**function_item(fc_id, call, "in_progress"), "arguments": ""},
                         )
                         yield emit(
                             "response.function_call_arguments.delta",
                             item_id=fc_id,
-                            output_index=output_index,
+                            output_index=index,
                             delta=json_dumps(call.arguments),
                         )
                         yield emit(
                             "response.function_call_arguments.done",
                             item_id=fc_id,
-                            output_index=output_index,
+                            output_index=index,
                             arguments=json_dumps(call.arguments),
                         )
                         yield emit(
                             "response.output_item.done",
-                            output_index=output_index,
+                            output_index=index,
                             item=function_item(fc_id, call),
                         )
                         response["output"].append(function_item(fc_id, call))
-                        output_index += 1
                     case OutputDone(finish=finish, error=error, usage=usage, kiro=kiro):
-                        if rs_id is not None:
-                            yield emit(
-                                "response.reasoning_summary_text.done",
-                                item_id=rs_id,
-                                output_index=output_index,
-                                summary_index=0,
-                                text=thoughts,
-                            )
-                            yield emit(
-                                "response.output_item.done",
-                                output_index=output_index,
-                                item=reasoning_item(rs_id, thoughts),
-                            )
-                            response["output"].append(reasoning_item(rs_id, thoughts))
-                            output_index += 1
-                        if msg_id is not None:
-                            yield emit(
-                                "response.output_text.done",
-                                item_id=msg_id,
-                                output_index=output_index,
-                                content_index=0,
-                                text=text,
-                                logprobs=[],
-                            )
-                            yield emit(
-                                "response.content_part.done",
-                                item_id=msg_id,
-                                output_index=output_index,
-                                content_index=0,
-                                part={"type": "output_text", "text": text, "annotations": []},
-                            )
-                            yield emit(
-                                "response.output_item.done",
-                                output_index=output_index,
-                                item=message_item(msg_id, text),
-                            )
-                            response["output"].append(message_item(msg_id, text))
-                            output_index += 1
+                        for line in close_reasoning():
+                            yield line
+                        for line in close_message():
+                            yield line
                         if finish == "error":
                             response["status"] = "failed"
                             response["error"] = {

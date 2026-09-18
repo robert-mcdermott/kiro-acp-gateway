@@ -37,6 +37,8 @@ class ToolResultPart:
     content: str
     is_error: bool = False
     name: str | None = None
+    images: list[ImagePart] = field(default_factory=list)
+    """Images returned by the tool (Anthropic ``tool_result`` blocks; e.g. a screenshot)."""
 
 
 Part = TextPart | ImagePart | ToolCallPart | ToolResultPart
@@ -75,10 +77,30 @@ class ToolDef:
 
 @dataclass(slots=True)
 class ToolChoice:
-    """``mode``: auto | none | required | named (then ``name`` is set)."""
+    """``mode``: auto | none | required | named (then ``name`` is set).
+
+    ``names`` restricts the tools the model may see (OpenAI ``allowed_tools``); with
+    ``mode="required"`` one of them must be called.
+    """
 
     mode: str = "auto"
     name: str | None = None
+    names: list[str] = field(default_factory=list)
+
+    def exposed(self, tools: list) -> list:
+        """The subset of ``tools`` the model should be offered."""
+        if self.mode == "none":
+            return []
+        if self.mode == "named":
+            return [t for t in tools if t.name == self.name] or tools
+        if self.names:
+            allowed = set(self.names)
+            return [t for t in tools if t.name in allowed]
+        return tools
+
+    @property
+    def must_call(self) -> bool:
+        return self.mode in ("required", "named")
 
 
 @dataclass(slots=True)

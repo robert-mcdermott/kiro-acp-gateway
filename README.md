@@ -724,6 +724,17 @@ the new messages to that session. Otherwise it starts a fresh session and replay
 history as a transcript. `KIRO_GATEWAY_SESSION_MODE=stateless` always starts fresh.
 Responses expose `kiro.session_id`, `kiro.reused_session`, `kiro.agent`, and `kiro.model`.
 
+**Tool choice.** `tool_choice` is honoured in both tool modes: `none` hides the tools,
+a named function (OpenAI `{"type": "function", ...}`, Anthropic `{"type": "tool", ...}`)
+and `allowed_tools` restrict what Kiro is offered (the session pool keys on the exposed
+set), and `required` / `any` must end in a tool call: a turn that answers in text instead
+fails with `502 tool_choice_unsatisfied` rather than being passed off as a normal reply.
+Stop sequences, `max_tokens` enforcement, and structured-output validation apply in both
+modes too; with the MCP bridge a schema failure is reported (`kiro.schema_valid`) but not
+re-prompted, because the session is shared with an open tool loop. Images returned in
+Anthropic `tool_result` blocks (a screenshot, an image file read by Claude Code) reach
+Kiro as MCP image content, and text sent alongside tool results is forwarded with them.
+
 **Client tools (harness mode).** Kiro cannot accept a client's tool definitions over ACP,
 so the gateway bridges them. In the default `mcp` tool mode it registers a small MCP server
 with each harness session (spawned by Kiro, part of this package) that advertises the

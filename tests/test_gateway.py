@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -1767,6 +1768,325 @@ async def test_dashboard_can_be_disabled(workspace: Path, engine: str) -> None:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://gw") as http:
             assert (await http.get("/dashboard")).status_code == 404
+
+
+# --------------------------------------------------------------------------- review findings
+
+
+async def test_identical_conversations_keep_distinct_pending_turns(
+    mcp_client: httpx.AsyncClient,
+) -> None:
+    """Finding 1: two identical tool requests must not share a pooled pending turn."""
+    body = {
+        "model": "x",
+        "messages": [{"role": "user", "content": 'mcp:Read:{"file_path": "a"}'}],
+        "tools": [READ_TOOL],
+    }
+    first, second = await asyncio.gather(
+        mcp_client.post("/v1/chat/completions", json=body),
+        mcp_client.post("/v1/chat/completions", json=body),
+    )
+    calls = [r.json()["choices"][0]["message"]["tool_calls"][0] for r in (first, second)]
+    assert calls[0]["id"] != calls[1]["id"]  # two Kiro processes, two bridge sessions
+    backend = mcp_client.app.state.backend  # type: ignore[attr-defined]
+    assert backend.health()["live_sessions"] == 1, "one pooled per fingerprint, the other closed"
+    # The surviving pending turn only continues with its own call id; the other id gets a
+    # fresh session instead of a synthetic 'no result' answer.
+    for response, call in zip((first, second), calls, strict=True):
+        follow = await mcp_client.post(
+            "/v1/chat/completions",
+            json={
+                **body,
+                "messages": [
+                    *body["messages"],
+                    response.json()["choices"][0]["message"],
+                    {"role": "tool", "tool_call_id": call["id"], "content": "notes"},
+                ],
+            },
+        )
+        assert follow.status_code == 200, follow.text
+        assert "No result was provided" not in follow.text
+
+
+async def test_displaced_session_is_closed_not_orphaned(client: httpx.AsyncClient) -> None:
+    body = {"model": "x", "messages": [{"role": "user", "content": "echo: same"}]}
+    await asyncio.gather(
+        client.post("/v1/chat/completions", json=body),
+        client.post("/v1/chat/completions", json=body),
+    )
+    backend = client.app.state.backend  # type: ignore[attr-defined]
+    assert backend.health()["live_sessions"] == 1
+    assert backend.health()["active_turns"] == 0
+
+
+async def test_tool_choice_restricts_exposed_tools_in_mcp_mode(
+    mcp_client: httpx.AsyncClient,
+) -> None:
+    """Finding 4: named / allowed_tools restrict what Kiro sees; required cannot end in text."""
+    base = {"model": "x", "tools": [READ_TOOL, BASH_TOOL]}
+    msg = [{"role": "user", "content": "tools?"}]
+    both = await mcp_client.post("/v1/chat/completions", json={**base, "messages": msg})
+    assert both.json()["choices"][0]["message"]["content"] == "tools: Read, Bash"
+    named = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            **base,
+            "messages": [{"role": "user", "content": 'mcp:Bash:{"n": 1}'}],
+            "tool_choice": {"type": "function", "function": {"name": "Bash"}},
+        },
+    )
+    assert named.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "Bash"
+    allowed = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            **base,
+            "messages": msg,
+            "tool_choice": {
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "auto",
+                    "tools": [{"type": "function", "function": {"name": "Bash"}}],
+                },
+            },
+        },
+    )
+    assert allowed.json()["choices"][0]["message"]["content"] == "tools: Bash"
+    required = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            **base,
+            "messages": [{"role": "user", "content": "echo: just text"}],
+            "tool_choice": "required",
+        },
+    )
+    assert required.status_code == 502
+    assert required.json()["error"]["code"] == "tool_choice_unsatisfied"
+    # Responses API allowed_tools shape, restricted set on the wire
+    responses = await mcp_client.post(
+        "/v1/responses",
+        json={
+            "model": "x",
+            "input": "tools?",
+            "tools": [
+                {"type": "function", "name": "Read", "parameters": {}},
+                {"type": "function", "name": "Bash", "parameters": {}},
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "auto",
+                "tools": [{"type": "function", "name": "Read"}],
+            },
+        },
+    )
+    assert responses.json()["output"][-1]["content"][0]["text"] == "tools: Read"
+
+
+async def test_tool_choice_required_in_emulate_mode(client: httpx.AsyncClient) -> None:
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "tools": [READ_TOOL],
+            "tool_choice": "required",
+            "messages": [{"role": "user", "content": "echo: no call here"}],
+        },
+    )
+    assert (
+        response.status_code == 502
+        and response.json()["error"]["code"] == "tool_choice_unsatisfied"
+    )
+
+
+async def test_mcp_path_enforces_stop_sequences_and_schema(mcp_client: httpx.AsyncClient) -> None:
+    """Finding 3: output limits and structured-output validation also apply with the bridge."""
+    stopped = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "tools": [READ_TOOL],
+            "stop": ["two"],
+            "messages": [{"role": "user", "content": "echo: one two three"}],
+        },
+    )
+    body = stopped.json()
+    assert body["choices"][0]["message"]["content"] == "one "
+    assert body["choices"][0]["finish_reason"] == "stop"
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+    good = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "tools": [READ_TOOL],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "s", "schema": schema},
+            },
+            "messages": [{"role": "user", "content": 'echo: ```json\n{"ok": true}\n```'}],
+        },
+    )
+    assert good.json()["kiro"]["schema_valid"] is True
+    assert json.loads(good.json()["choices"][0]["message"]["content"]) == {"ok": True}
+    bad = await mcp_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "x",
+            "tools": [READ_TOOL],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "s", "schema": schema},
+            },
+            "messages": [{"role": "user", "content": "echo: not json"}],
+        },
+    )
+    assert bad.json()["kiro"]["schema_valid"] is False and bad.json()["kiro"]["schema_errors"]
+
+
+async def test_tool_result_images_and_text_reach_the_bridge(mcp_client: httpx.AsyncClient) -> None:
+    """Finding 6: Anthropic tool_result images and accompanying text are delivered."""
+    tools = [
+        {
+            "name": "Read",
+            "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}}},
+        }
+    ]
+    first = await mcp_client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={
+            "model": "x",
+            "max_tokens": 100,
+            "tools": tools,
+            "messages": [{"role": "user", "content": 'mcp:Read:{"n": 1}'}],
+        },
+    )
+    assert first.status_code == 200, first.text
+    reply = first.json()
+    tool_use = next(b for b in reply["content"] if b["type"] == "tool_use")
+    second = await mcp_client.post(
+        "/v1/messages",
+        headers=ANTHROPIC_HEADERS,
+        json={
+            "model": "x",
+            "max_tokens": 100,
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": 'mcp:Read:{"n": 1}'},
+                {"role": "assistant", "content": reply["content"]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use["id"],
+                            "content": [
+                                {"type": "text", "text": "screenshot taken"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "aGVsbG8=",
+                                    },
+                                },
+                            ],
+                        },
+                        {"type": "text", "text": "Now describe it."},
+                    ],
+                },
+            ],
+        },
+    )
+    assert second.status_code == 200, second.text
+    text = second.json()["content"][0]["text"]
+    assert "screenshot taken" in text and "[image image/png 8b]" in text
+    assert "[User message]: Now describe it." in text
+
+
+async def test_keepalive_wrapper_closes_source_cleanly() -> None:
+    """Finding 5: cancelling the pending __anext__ must finish before the source is closed."""
+    from kiro_acp.gateway.protocols.common import with_keepalive
+
+    closed = []
+
+    async def source():
+        try:
+            yield "a"
+            await asyncio.sleep(10)
+            yield "b"
+        finally:
+            await asyncio.sleep(0.01)  # asynchronous cleanup
+            closed.append(True)
+
+    wrapper = with_keepalive(source(), interval=0.05, ping=": ping")
+    got = [await wrapper.__anext__(), await wrapper.__anext__()]
+    assert got == ["a", ": ping"]
+    await wrapper.aclose()  # used to raise "aclose(): asynchronous generator is already running"
+    assert closed == [True]
+
+
+async def test_responses_stream_assembles_with_openai_sdk(client: httpx.AsyncClient) -> None:
+    """Finding 2: reasoning, text and tool calls keep distinct output indexes."""
+    from openai import AsyncOpenAI
+
+    sdk = AsyncOpenAI(
+        base_url="http://gw/v1",
+        api_key="secret",
+        http_client=httpx.AsyncClient(transport=client._transport, base_url="http://gw"),  # noqa: SLF001
+    )
+    tools = [
+        {"type": "function", "name": "Read", "parameters": {"type": "object", "properties": {}}}
+    ]
+    call = '<tool_call>{"name": "Read", "arguments": {}}</tool_call>'
+    async with sdk.responses.stream(model="x", input="thought:" + call, tools=tools) as stream:
+        events = [e async for e in stream]
+        final = await stream.get_final_response()
+    kinds = [item.type for item in final.output]
+    assert kinds == ["reasoning", "function_call"], kinds
+    assert final.output[0].summary[0].text == "considering the tools"
+    assert final.output[1].name == "Read"
+    indexes = {
+        (e.output_index, e.item.type) for e in events if e.type == "response.output_item.added"
+    }
+    assert indexes == {(0, "reasoning"), (1, "function_call")}
+    done = [(e.output_index, e.item.type) for e in events if e.type == "response.output_item.done"]
+    assert sorted(done) == [(0, "reasoning"), (1, "function_call")]
+    # thought, then text
+    async with sdk.responses.stream(model="x", input="thought:plain answer") as stream:
+        final2 = await stream.get_final_response()
+    assert [i.type for i in final2.output] == ["reasoning", "message"]
+    assert final2.output_text == "plain answer"
+
+
+async def test_messages_stream_assembles_with_anthropic_sdk(client: httpx.AsyncClient) -> None:
+    import httpx2  # the Anthropic SDK ships its own httpx fork
+    from anthropic import AsyncAnthropic
+
+    sdk = AsyncAnthropic(
+        base_url="http://gw",
+        api_key="secret",
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=client.app),  # type: ignore[attr-defined]
+            base_url="http://gw",
+        ),
+    )
+    call = '<tool_call>{"name": "Read", "arguments": {"n": 1}}</tool_call>'
+    async with sdk.messages.stream(
+        model="x",
+        max_tokens=100,
+        thinking={"type": "enabled", "budget_tokens": 1024},
+        tools=[
+            {
+                "name": "Read",
+                "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}}},
+            }
+        ],
+        messages=[{"role": "user", "content": "thought:" + call}],
+    ) as stream:
+        final = await stream.get_final_message()
+    kinds = [b.type for b in final.content]
+    assert kinds == ["thinking", "tool_use"], kinds
+    assert final.content[1].name == "Read" and final.content[1].input == {"n": 1}
+    assert final.stop_reason == "tool_use"
 
 
 async def test_metrics_endpoint(client: httpx.AsyncClient) -> None:

@@ -5,7 +5,7 @@ from kiro_acp.acp.errors import ACPError, ACPProcessError, ACPRemoteError, ACPTi
 from kiro_acp.acp.kiro import KiroAgent, KiroLaunchOptions
 from kiro_acp.acp.session import Session, TurnResult
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "ACPClient",

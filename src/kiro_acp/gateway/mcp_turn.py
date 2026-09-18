@@ -96,13 +96,22 @@ class PendingTurn:
         self.awaiting[client_id] = part
         self.bridge_ids[client_id] = bridge_call_id
 
-    async def deliver(self, client_id: str, content: str, *, is_error: bool = False) -> bool:
+    async def deliver(
+        self,
+        client_id: str,
+        content: str,
+        *,
+        is_error: bool = False,
+        images: list[JSON] | None = None,
+    ) -> bool:
         bridge_id = self.bridge_ids.pop(client_id, None)
         self.awaiting.pop(client_id, None)
         self.last_activity = time.monotonic()
         if bridge_id is None:
             return False
-        return await self.bridge.deliver_result(bridge_id, content, is_error=is_error)
+        return await self.bridge.deliver_result(
+            bridge_id, content, is_error=is_error, images=images
+        )
 
     async def cancel(self, reason: str = "cancelled") -> None:
         await self.bridge.cancel(reason)

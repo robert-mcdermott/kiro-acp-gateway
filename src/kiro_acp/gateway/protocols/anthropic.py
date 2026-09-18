@@ -195,9 +195,9 @@ def parse_user(conversation: Conversation, content: Any) -> None:
                     call_id=str(block.get("tool_use_id", "")),
                     content=text,
                     is_error=bool(block.get("is_error")),
+                    images=images,
                 )
             )
-            parts.extend(images)
         elif kind == "document":
             source = block.get("source") or {}
             if source.get("type") == "text":
