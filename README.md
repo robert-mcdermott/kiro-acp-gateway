@@ -38,7 +38,7 @@ Everything is managed with [uv](https://docs.astral.sh/uv/).
 ## Installation
 
 ```bash
-git clone https://github.com/rmcdermo/kiro-acp-gateway.git
+git clone https://github.com/robert-mcdermott/kiro-acp-gateway.git
 cd kiro-acp-gateway
 uv sync
 ```

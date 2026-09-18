@@ -7,6 +7,21 @@ license = "Apache-2.0"
 authors = [{ name = "Robert McDermott", email = "robert.c.mcdermott@gmail.com" }]
 requires-python = ">=3.11"
 keywords = ["kiro", "acp", "agent-client-protocol", "openai", "anthropic", "gateway"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -20,7 +35,10 @@ kiro-acp = "kiro_acp.cli.main:main"
 kiro-gateway = "kiro_acp.gateway.main:main"
 
 [project.urls]
-Homepage = "https://github.com/rmcdermo/kiro-acp-gateway"
+Homepage = "https://github.com/robert-mcdermott/kiro-acp-gateway"
+Repository = "https://github.com/robert-mcdermott/kiro-acp-gateway"
+Issues = "https://github.com/robert-mcdermott/kiro-acp-gateway/issues"
+Changelog = "https://github.com/robert-mcdermott/kiro-acp-gateway/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

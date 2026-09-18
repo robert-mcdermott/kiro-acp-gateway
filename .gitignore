@@ -12,3 +12,6 @@ wheels/
 # Local configuration
 .env
 *.swp
+
+# macOS
+.DS_Store
