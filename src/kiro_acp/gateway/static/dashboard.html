@@ -89,6 +89,20 @@
   .btn.primary { background: var(--accent); color: #fff; border-color: transparent; }
   .btn.primary:hover { filter: brightness(1.05); }
   #error { color: var(--bad); font-size: 13px; margin-top: 10px; min-height: 1em; }
+
+  .rowlink { cursor: pointer; }
+  #drawerBack { position: fixed; inset: 0; background: rgba(15, 23, 42, .35); display: none; z-index: 20; }
+  #drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100%); background: var(--panel); border-left: 1px solid var(--line); box-shadow: -8px 0 24px rgba(0,0,0,.15); display: none; z-index: 21; flex-direction: column; }
+  #drawer.open, #drawerBack.open { display: flex; }
+  #drawerBack.open { display: block; }
+  .drawer-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  .drawer-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
+  .drawer-body { overflow: auto; padding: 8px 18px 18px; }
+  .rec { display: grid; grid-template-columns: 84px 110px 1fr; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); align-items: start; }
+  .rec:last-child { border-bottom: 0; }
+  .rec .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .rec pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; color: var(--muted); background: var(--panel-2); padding: 6px 8px; border-radius: 6px; max-height: 220px; overflow: auto; }
+  .rec .summary { font-weight: 500; }
 </style>
 </head>
 <body>
@@ -127,6 +141,12 @@
   <section class="panel"><div class="panel-head"><h2>Errors</h2><span class="hint">API errors by code</span></div><div id="errors"></div></section>
   <section class="panel wide"><div class="panel-head"><h2>Recent sessions</h2><span class="hint">from the audit ledger; open a session for its records</span></div><div id="audit"></div></section>
 </main>
+
+<div id="drawerBack"></div>
+<aside id="drawer" aria-label="Session audit records">
+  <div class="drawer-head"><h3 id="drawerTitle">Session</h3><span class="muted mono" id="drawerId"></span><span class="spacer"></span><button class="btn" id="drawerClose">Close</button></div>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
 
 <script>
 (function () {
@@ -215,10 +235,49 @@
     $("errors").innerHTML = table(["Code", "Status", "Count"], m.errors.map(r => [`<span class="mono">${esc(r.code)}</span>`, r.status, r.value]), [1, 2]);
     $("audit").innerHTML = table(["Session", "Last activity", "Records", "Activity"],
       d.audit.slice().reverse().map(a => [
-        `<a class="mono" href="/v1/kiro/sessions/${encodeURIComponent(a.session_id)}/audit" target="_blank" rel="noopener" title="${esc(a.session_id)}">${esc(shortId(a.session_id))}</a>`,
+        `<a class="mono rowlink" data-session="${esc(a.session_id)}" title="${esc(a.session_id)}">${esc(shortId(a.session_id))}</a>`,
         a.updated ? fmtTime(a.updated) : "", a.records,
         Object.entries(a.kinds).map(([k, v]) => `<span class="pill">${esc(k)} ${v}</span>`).join(" ")]), [2]);
+    $("audit").querySelectorAll(".rowlink").forEach(el => el.addEventListener("click", () => openSession(el.dataset.session)));
   }
+
+  // ---- audit drawer: records fetched with the key, rendered in-page
+  const KIND_CLASS = { stall: "busy", turn_end: "", permission: "", tool_call: "tool_calls", harness_tool_call: "tool_calls", tool_result: "" };
+  function summarize(r) {
+    switch (r.kind) {
+      case "turn": return `${r.mode} turn · ${r.model || ""}${r.reused ? " · reused session" : ""}`;
+      case "turn_end": return `finished: ${r.stop}${r.error ? " · " + r.error : ""}`;
+      case "tool_call": return `${r.title || r.tool || ""}`;
+      case "tool_result": return `${r.status}`;
+      case "harness_tool_call": return `client tool ${r.name}`;
+      case "permission": return `${r.decision} · ${r.title || r.tool || ""}${r.reason ? " (" + r.reason + ")" : ""}`;
+      case "stall": return `no output for ${r.seconds}s${r.tool ? " while running " + r.tool : ""}`;
+      default: return "";
+    }
+  }
+  async function openSession(id) {
+    $("drawerTitle").textContent = "Session audit"; $("drawerId").textContent = id;
+    $("drawerBody").innerHTML = '<p class="empty">Loading…</p>';
+    $("drawer").classList.add("open"); $("drawerBack").classList.add("open");
+    try {
+      const r = await fetch(`/v1/kiro/sessions/${encodeURIComponent(id)}/audit`, { headers: { Authorization: "Bearer " + key }, cache: "no-store" });
+      if (!r.ok) throw new Error(r.status + " " + r.statusText);
+      const data = await r.json();
+      const skip = new Set(["time", "kind"]);
+      $("drawerBody").innerHTML = (data.dropped ? `<p class="muted">${data.dropped} older record(s) were dropped by the per-session limit.</p>` : "") +
+        (data.records.length ? data.records.map(rec => {
+          const rest = Object.fromEntries(Object.entries(rec).filter(([k, v]) => !skip.has(k) && v !== null && v !== "" && v !== undefined));
+          const detail = Object.keys(rest).length ? `<pre>${esc(JSON.stringify(rest, null, 1).replace(/^\{\n|\n\}$/g, ""))}</pre>` : "";
+          return `<div class="rec"><span class="t mono">${fmtTime(rec.time)}</span><span><span class="pill ${KIND_CLASS[rec.kind] || ""}">${esc(rec.kind)}</span></span><div><div class="summary">${esc(summarize(rec))}</div>${detail}</div></div>`;
+        }).join("") : '<p class="empty">No records.</p>');
+    } catch (e) {
+      $("drawerBody").innerHTML = `<p class="empty">Could not load records: ${esc(e.message)}</p>`;
+    }
+  }
+  function closeDrawer() { $("drawer").classList.remove("open"); $("drawerBack").classList.remove("open"); }
+  $("drawerClose").addEventListener("click", closeDrawer);
+  $("drawerBack").addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
 
   async function refresh() {
     if (!key) { showLogin(""); return; }
