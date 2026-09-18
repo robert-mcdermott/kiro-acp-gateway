@@ -9,6 +9,9 @@ from openai import OpenAI
 client = OpenAI(
     base_url=os.environ.get("KIRO_GATEWAY_URL", "http://127.0.0.1:8000") + "/v1",
     api_key=os.environ.get("KIRO_GATEWAY_KEY", "your-gateway-key"),
+    # Agent mode: the project Kiro's own tools work in (must match KIRO_GATEWAY_ALLOWED_WORKSPACES).
+    # Ignored for requests that carry tools, which the caller executes itself.
+    default_headers={"X-Kiro-Workspace": os.environ.get("KIRO_WORKSPACE", os.getcwd())},
 )
 
 # Plain completion (agent mode).

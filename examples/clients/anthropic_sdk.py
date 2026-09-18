@@ -7,6 +7,8 @@ from anthropic import Anthropic
 client = Anthropic(
     base_url=os.environ.get("KIRO_GATEWAY_URL", "http://127.0.0.1:8000"),
     api_key=os.environ.get("KIRO_GATEWAY_KEY", "your-gateway-key"),
+    # Agent mode: the project Kiro's own tools work in (must match KIRO_GATEWAY_ALLOWED_WORKSPACES).
+    default_headers={"X-Kiro-Workspace": os.environ.get("KIRO_WORKSPACE", os.getcwd())},
 )
 
 with client.messages.stream(

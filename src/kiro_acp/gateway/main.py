@@ -62,10 +62,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--env-file",
-        default=".env",
-        help="env file the printed service loads (default .env in the project directory)",
+        default=None,
+        help="env file with KIRO_GATEWAY_* settings (default: .env in the current directory, "
+        "else ~/.config/kiro-gateway/.env); also the file a printed service loads",
     )
     return parser
+
+
+DEFAULT_ENV_FILES = (".env", os.path.expanduser("~/.config/kiro-gateway/.env"))
+
+
+def resolve_env_file(explicit: str | None) -> str | None:
+    """The env file to load: an explicit path (must exist), else the first default that exists."""
+    if explicit:
+        path = os.path.expanduser(explicit)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"env file not found: {path}")
+        return path
+    for candidate in DEFAULT_ENV_FILES:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def service_definition(kind: str, *, env_file: str, project_dir: str) -> str:
@@ -137,19 +154,25 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         }.items()
         if value is not None
     }
-    return Settings(**overrides)
+    env_file = resolve_env_file(args.env_file)
+    return Settings(_env_file=env_file, **overrides)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.print_service:
         print(
-            service_definition(args.print_service, env_file=args.env_file, project_dir=os.getcwd()),
+            service_definition(
+                args.print_service, env_file=args.env_file or ".env", project_dir=os.getcwd()
+            ),
             end="",
         )
         return 0
     try:
         settings = settings_from_args(args)
+    except FileNotFoundError as error:
+        print(f"configuration error: {error}", file=sys.stderr)
+        return 2
     except Exception as error:  # pydantic validation
         print(f"configuration error: {error}", file=sys.stderr)
         return 2

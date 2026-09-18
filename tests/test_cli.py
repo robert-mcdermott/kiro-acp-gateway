@@ -162,3 +162,21 @@ def test_gateway_print_service_units(tmp_path, monkeypatch, capsys) -> None:
     assert gateway_main(["--print-service", "launchd"]) == 0
     plist = capsys.readouterr().out
     assert "<plist" in plist and "dev.kiro.acp-gateway" in plist and str(tmp_path) in plist
+
+
+def test_gateway_env_file_resolution(tmp_path, monkeypatch) -> None:
+    from kiro_acp.gateway import main as gateway_main_module
+    from kiro_acp.gateway.main import build_parser, resolve_env_file, settings_from_args
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("KIRO_GATEWAY_PORT", raising=False)
+    monkeypatch.setattr(gateway_main_module, "DEFAULT_ENV_FILES", (".env", str(tmp_path / "none")))
+    assert resolve_env_file(None) is None
+    (tmp_path / "custom.env").write_text("KIRO_GATEWAY_PORT=9555\n")
+    settings = settings_from_args(build_parser().parse_args(["--env-file", "custom.env"]))
+    assert settings.port == 9555
+    (tmp_path / ".env").write_text("KIRO_GATEWAY_PORT=9666\n")
+    assert resolve_env_file(None) == ".env"
+    assert settings_from_args(build_parser().parse_args([])).port == 9666
+    with pytest.raises(FileNotFoundError):
+        resolve_env_file("missing.env")

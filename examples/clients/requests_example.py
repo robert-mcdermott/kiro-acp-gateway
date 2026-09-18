@@ -7,7 +7,14 @@ import requests
 
 GATEWAY = os.environ.get("KIRO_GATEWAY_URL", "http://127.0.0.1:8000")
 KEY = os.environ.get("KIRO_GATEWAY_KEY", "your-gateway-key")
-HEADERS = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
+# Agent mode: Kiro's own tools run in WORKSPACE on the gateway host, so send the project
+# directory (default: where this script runs). It must match KIRO_GATEWAY_ALLOWED_WORKSPACES.
+WORKSPACE = os.environ.get("KIRO_WORKSPACE", os.getcwd())
+HEADERS = {
+    "Authorization": f"Bearer {KEY}",
+    "Content-Type": "application/json",
+    "X-Kiro-Workspace": WORKSPACE,
+}
 
 # 1. Non-streaming chat completion (agent mode: Kiro may use its own tools in the workspace)
 r = requests.post(

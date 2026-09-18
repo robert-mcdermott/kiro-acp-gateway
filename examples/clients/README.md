@@ -15,5 +15,12 @@ both to match yours. Model ids come from `curl -s $URL/v1/models -H "Authorizati
 | OpenCode | `opencode.json` | harness | `opencode` and pick the Kiro provider |
 | Any OpenAI-compatible harness (Collomia, Kilo, Cline, Continue, LiteLLM, Vercel AI SDK) | see `generic-openai-compatible.md` | harness | its own model list |
 
+**Agent-mode examples (curl, requests, the SDK scripts) send `X-Kiro-Workspace` set to
+the directory they run in**, because without tools in the request Kiro's own tools run on
+the gateway host and need to be told which project to work in. Start the gateway with
+`KIRO_GATEWAY_ALLOWED_WORKSPACES` covering your projects (see the README). The harness
+examples (Claude Code, Codex, OpenCode) need nothing of the sort: they run their tools
+in their own directory.
+
 Recommended models: `claude-sonnet-4.6` or `claude-opus-4.8` for agent work, `gpt-5.6-luna`
 as the small fast model (Claude Code background calls, Codex code mode).

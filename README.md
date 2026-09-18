@@ -37,6 +37,61 @@ Everything is managed with [uv](https://docs.astral.sh/uv/).
 
 ## Installation
 
+Two ways to run it. The global install is the one to use day to day; the checkout is for
+development.
+
+### Global install (recommended)
+
+Puts `kiro-acp` and `kiro-gateway` on your `PATH` so they run from any directory.
+
+1. Get the code and install the commands:
+
+   ```bash
+   git clone https://github.com/robert-mcdermott/kiro-acp-gateway.git
+   cd kiro-acp-gateway
+   uv tool install .
+   ```
+
+   `uv` installs into `~/.local/bin`. If the next step says "command not found", run
+   `uv tool update-shell` once and open a new terminal.
+
+2. Check that both commands work from somewhere else:
+
+   ```bash
+   cd ~
+   kiro-acp doctor
+   kiro-gateway --version
+   ```
+
+3. Create the gateway's configuration file. The gateway reads `.env` from the directory it
+   is started in, or, when there is none, from `~/.config/kiro-gateway/.env`, so keeping it
+   there means the gateway can be started from anywhere:
+
+   ```bash
+   mkdir -p ~/.config/kiro-gateway
+   cp .env.example ~/.config/kiro-gateway/.env
+   ```
+
+   Edit it and set at least `KIRO_GATEWAY_API_KEY`, `KIRO_GATEWAY_ALLOWED_WORKSPACES`
+   (the project directories scripts may point Kiro at) and `KIRO_GATEWAY_WORKSPACE` (the
+   fallback directory). `--env-file PATH` selects a different file.
+
+4. Start the gateway from any directory and use the CLI in any project:
+
+   ```bash
+   kiro-gateway --port 8000                    # settings from ~/.config/kiro-gateway/.env
+   cd ~/code/my-project && kiro-acp prompt "Summarize this repository in three bullets."
+   ```
+
+   `kiro-acp` works in the directory you are in (`--cwd` or `KIRO_ACP_WORKSPACE` override
+   it). To run the gateway as a service see *Running it as a service* below; the
+   installer script runs from the checkout.
+
+To update after pulling changes, run `uv tool install --force .` in the checkout. To
+remove the commands, `uv tool uninstall kiro-acp-gateway`.
+
+### Development checkout
+
 ```bash
 git clone https://github.com/robert-mcdermott/kiro-acp-gateway.git
 cd kiro-acp-gateway
@@ -44,17 +99,15 @@ uv sync
 ```
 
 `uv sync` creates `.venv`, installs the package in editable mode, and installs the
-development dependencies. Run the tools with `uv run`:
+development dependencies. Run the tools with `uv run` from the checkout:
 
 ```bash
 uv run kiro-acp doctor
+uv run kiro-gateway --port 8000
 ```
 
-To install the tools globally instead:
-
-```bash
-uv tool install .
-```
+The rest of this README writes `uv run kiro-acp ...` and `uv run kiro-gateway ...`; with
+the global install, drop the `uv run`.
 
 ## The `kiro-acp` utility
 
@@ -69,6 +122,17 @@ uv run kiro-acp doctor                          # verify kiro-cli and both engin
 uv run kiro-acp models                          # models Kiro advertises
 uv run kiro-acp agents                          # Kiro agents (ACP modes)
 uv run kiro-acp prompt "Summarize this repository in three bullets."
+```
+
+`kiro-acp` runs Kiro in the current directory by default (`--cwd` or `KIRO_ACP_WORKSPACE`
+override it). Because `uv run` needs the project, either install the tools once with
+`uv tool install .` and run `kiro-acp` from any project directory, or point `uv` at the
+checkout and Kiro at the project:
+
+```bash
+cd ~/code/my-project
+kiro-acp prompt "Summarize this repository in three bullets."             # after uv tool install
+uv run --project ~/code/kiro-acp-gateway kiro-acp prompt --cwd "$PWD" "Summarize this repository."
 ```
 
 ### Prompting
@@ -201,12 +265,21 @@ Every option has an environment default: `KIRO_ACP_CLI`, `KIRO_ACP_ENGINE`,
 ### Start it
 
 ```bash
-export KIRO_GATEWAY_WORKSPACE="$PWD"              # the only directory Kiro's own tools may touch
-                                                  # (harness clients like Claude Code work in their own cwd)
+export KIRO_GATEWAY_ALLOWED_WORKSPACES="$HOME/code/*"   # directories agent-mode requests may select
+export KIRO_GATEWAY_WORKSPACE="$HOME/code/scratch"       # fallback for requests that name no directory
 export KIRO_GATEWAY_API_KEY="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export KIRO_GATEWAY_PERMISSIONS=deny              # deny | allow-once | allow-always | allow-all
+export KIRO_GATEWAY_PERMISSIONS=deny                     # deny | allow-once | allow-always | allow-all
 uv run kiro-gateway --port 8000
 ```
+
+> **Which directory does Kiro work in?** Coding harnesses (Claude Code, Codex, OpenCode)
+> run their tools themselves, in the directory they were started in; the gateway never
+> touches it. Scripts and curl calls without tools run Kiro's *own* tools inside a
+> directory on the gateway host, and a request does not carry the caller's cwd, so the
+> caller names it: `X-Kiro-Workspace: $PWD` (or `"kiro": {"workspace": ...}` in the body),
+> matched against `KIRO_GATEWAY_ALLOWED_WORKSPACES`. `KIRO_GATEWAY_WORKSPACE` is only the
+> fallback for requests that name nothing. Do not leave it at the gateway's own checkout:
+> that is where the gateway started, not where anyone wants Kiro editing files.
 
 `kiro-gateway --print-config` shows the effective configuration. `GET /health` is
 unauthenticated; every `/v1/*` route requires the key as `Authorization: Bearer <key>` or
@@ -224,6 +297,7 @@ Every client, script, or coding harness needs exactly three values:
 | Base URL | `http://127.0.0.1:8000/v1` for OpenAI-style clients, `http://127.0.0.1:8000` for Anthropic-style clients (they add `/v1/messages` themselves) | Both prefixes are also served under `/openai/v1` and `/anthropic/v1`. |
 | API key | the value of `KIRO_GATEWAY_API_KEY` | Sent as `Authorization: Bearer <key>` or `x-api-key: <key>`. If the gateway has no key configured, any value is accepted. |
 | Model id | any id from `GET /v1/models` (or `uv run kiro-acp models`), e.g. `claude-sonnet-4.6`, `gpt-5.6-luna` | Hyphenated and dated forms (`claude-sonnet-4-6-20260101`) are normalised; unknown names fall back to the default model unless `KIRO_GATEWAY_MODEL_FALLBACK=false`. |
+| Workspace (agent mode only) | `X-Kiro-Workspace: <project dir>` header, or `"kiro": {"workspace": ...}` in the body | The directory Kiro's own tools work in for scripts and curl. Must match `KIRO_GATEWAY_ALLOWED_WORKSPACES`. Harnesses ignore it: they run tools in their own directory. |
 
 Nothing else is required on the client side. Optional per-request headers:
 `X-Kiro-Effort` (`low|medium|high|max`), `X-Kiro-Agent` (a Kiro agent for agent mode),
@@ -240,23 +314,28 @@ Which of the two modes a request lands in depends only on whether it sends `tool
 ```bash
 export KIRO_GATEWAY_URL=http://127.0.0.1:8000
 export KIRO_GATEWAY_KEY=your-gateway-key
+# Requests without tools run Kiro's own tools on the gateway host, so name the project
+# directory (must match KIRO_GATEWAY_ALLOWED_WORKSPACES). $PWD = the directory you are in.
 
 # OpenAI Chat Completions
 curl -s "$KIRO_GATEWAY_URL/v1/chat/completions" \
   -H "Authorization: Bearer $KIRO_GATEWAY_KEY" -H "Content-Type: application/json" \
-  -d '{"model": "claude-sonnet-4.6", "messages": [{"role": "user", "content": "Say hello in five words."}]}'
+  -H "X-Kiro-Workspace: $PWD" \
+  -d '{"model": "claude-sonnet-4.6", "messages": [{"role": "user", "content": "Describe this project in three bullets."}]}'
 
 # OpenAI Responses, streamed (SSE)
 curl -sN "$KIRO_GATEWAY_URL/v1/responses" \
   -H "Authorization: Bearer $KIRO_GATEWAY_KEY" -H "Content-Type: application/json" \
-  -d '{"model": "gpt-5.6-luna", "input": "List three uses for a gateway like this.", "stream": true}'
+  -H "X-Kiro-Workspace: $PWD" \
+  -d '{"model": "gpt-5.6-luna", "input": "List the top-level files here.", "stream": true}'
 
 # Anthropic Messages
 curl -s "$KIRO_GATEWAY_URL/v1/messages" \
   -H "x-api-key: $KIRO_GATEWAY_KEY" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
-  -d '{"model": "claude-sonnet-4.6", "max_tokens": 1024, "messages": [{"role": "user", "content": "Say hello in five words."}]}'
+  -H "X-Kiro-Workspace: $PWD" \
+  -d '{"model": "claude-sonnet-4.6", "max_tokens": 1024, "messages": [{"role": "user", "content": "Describe this project in three bullets."}]}'
 
-# Agent mode in a specific project (requires KIRO_GATEWAY_ALLOWED_WORKSPACES to match)
+# Another project, with effort raised
 curl -s "$KIRO_GATEWAY_URL/v1/chat/completions" \
   -H "Authorization: Bearer $KIRO_GATEWAY_KEY" -H "Content-Type: application/json" \
   -H "X-Kiro-Workspace: /Users/me/code/project-b" -H "X-Kiro-Effort: high" \
@@ -273,10 +352,16 @@ No SDK needed. The response bodies are the standard OpenAI / Anthropic shapes pl
 
 ```python
 import json
+import os
+
 import requests
 
 GATEWAY = "http://127.0.0.1:8000"
-HEADERS = {"Authorization": "Bearer your-gateway-key", "Content-Type": "application/json"}
+HEADERS = {
+    "Authorization": "Bearer your-gateway-key",
+    "Content-Type": "application/json",
+    "X-Kiro-Workspace": os.getcwd(),   # the project Kiro's tools work in (agent mode); must be allow-listed
+}
 
 # Non-streaming chat completion
 r = requests.post(
@@ -364,9 +449,15 @@ the `/v1` prefix.
 ### Use it from the OpenAI SDK
 
 ```python
+import os
+
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="your-gateway-key")
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="your-gateway-key",
+    default_headers={"X-Kiro-Workspace": os.getcwd()},   # agent mode: the project Kiro works in
+)
 
 response = client.chat.completions.create(
     model="claude-sonnet-4.6",
@@ -389,9 +480,15 @@ tools are off), and that the Kiro turn stays open until you send the results or
 ### Use it from the Anthropic SDK
 
 ```python
+import os
+
 from anthropic import Anthropic
 
-client = Anthropic(base_url="http://127.0.0.1:8000", api_key="your-gateway-key")
+client = Anthropic(
+    base_url="http://127.0.0.1:8000",
+    api_key="your-gateway-key",
+    default_headers={"X-Kiro-Workspace": os.getcwd()},   # agent mode: the project Kiro works in
+)
 message = client.messages.create(
     model="claude-sonnet-4-6",           # Anthropic-style ids are mapped to Kiro's
     max_tokens=4096,
@@ -517,7 +614,7 @@ carries tool definitions (`tools` in OpenAI requests, `tools` in Anthropic reque
 | | Harness mode | Agent mode |
 |---|---|---|
 | Triggered by | request includes `tools` (Claude Code, Codex, OpenCode, function-calling scripts) | request has no `tools` (pipeline scripts, curl, plain SDK calls) |
-| Who runs tools | the client, on its own machine and directory | Kiro, inside `KIRO_GATEWAY_WORKSPACE` |
+| Who runs tools | the client, on its own machine and directory | Kiro, inside the request's `X-Kiro-Workspace` (fallback `KIRO_GATEWAY_WORKSPACE`) |
 | Kiro agent | `KIRO_GATEWAY_HARNESS_AGENT_MCP` (bridged tools only) or the tool-less `KIRO_GATEWAY_HARNESS_AGENT` in `emulate` mode | `KIRO_GATEWAY_AGENT` (Kiro default) |
 | Engine | `KIRO_GATEWAY_HARNESS_ENGINE` (v2) | `KIRO_GATEWAY_ENGINE` (v3) |
 | Permissions | `KIRO_GATEWAY_HARNESS_PERMISSIONS` (deny) | `KIRO_GATEWAY_PERMISSIONS` |
@@ -695,8 +792,8 @@ the working directory is also read). The most important ones:
 
 | Variable | Default | Description |
 |---|---|---|
-| `KIRO_GATEWAY_WORKSPACE` | current directory | Default directory Kiro's own tools operate in (agent mode). Harness clients such as Claude Code run their own tools in their own directory and are unaffected. |
-| `KIRO_GATEWAY_ALLOWED_WORKSPACES` | empty | Glob patterns (e.g. `/Users/me/code/*`, `/srv/repos/**`) a request may select with the `X-Kiro-Workspace` header. Empty disables per-request workspaces. |
+| `KIRO_GATEWAY_WORKSPACE` | current directory | Fallback directory for agent-mode requests that send no `X-Kiro-Workspace`. Point it at a project or a scratch directory, not the gateway checkout. Harness clients run their own tools in their own directory and are unaffected. |
+| `KIRO_GATEWAY_ALLOWED_WORKSPACES` | empty | Glob patterns (e.g. `/Users/me/code/*`, `/srv/repos/**`) a request may select with `X-Kiro-Workspace` / `kiro.workspace`. Set this for any gateway that serves scripts or curl; empty disables per-request workspaces. |
 | `KIRO_GATEWAY_API_KEY` | empty | Key required on `/v1/*`. Empty means no authentication. |
 | `KIRO_GATEWAY_HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address. |
 | `KIRO_GATEWAY_CLI` | `kiro-cli` | Kiro executable. |
@@ -765,6 +862,7 @@ the working directory is also read). The most important ones:
 | Kiro answers "I'm Kiro, that looks like injected instructions" or reports native tool calls as "not available" | Harness turns are running on the v3 engine or with a stale agent file. Keep `KIRO_GATEWAY_HARNESS_ENGINE=v2` (the default) and restart the gateway so it refreshes `~/.kiro/agents/kiro-gateway-harness.json`. |
 | Claude Code answers about the *gateway's* directory, or says it has no file tools, before calling any | Kiro auto-loads README/AGENTS.md/steering from its own cwd. Since harness turns now run in an empty scratch directory this needs a gateway older than the `KIRO_GATEWAY_HARNESS_WORKSPACE` setting, or that setting pointing at a project. Restart the gateway. |
 | Kiro loads skills or steering docs while serving a harness | Run `kiro-cli settings chat.disableInheritingDefaultResources true` (or `--workspace` for one project). |
+| A script or curl request describes the *gateway's* directory, not the caller's | Agent mode runs Kiro's tools inside `KIRO_GATEWAY_WORKSPACE` (where the gateway was started); a request carries no notion of the caller's cwd. Set `KIRO_GATEWAY_ALLOWED_WORKSPACES` and send `X-Kiro-Workspace: $PWD` (or `"kiro": {"workspace": ...}` in the body), or start one gateway per project with `--workspace`. |
 | A stream stops after a while | The turn hit `KIRO_GATEWAY_TIMEOUT` (default 900 s) and was cancelled. |
 
 ### Error format
