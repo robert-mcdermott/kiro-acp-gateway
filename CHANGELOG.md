@@ -4,6 +4,36 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-09-18
+
+### Fixed
+
+- Dashboard: clicking a session in "Recent sessions" opened the audit endpoint as a plain
+  navigation, which cannot carry the API key and answered `401`. Records now open in a
+  side panel inside the dashboard, fetched with the stored key, with a summary and the
+  redacted details of every turn, tool call, permission decision, and stall.
+
+### Added
+
+- `kiro-gateway --env-file PATH`, and automatic loading of `~/.config/kiro-gateway/.env`
+  when the current directory has no `.env`, so a globally installed gateway can be started
+  from any directory with one configuration file.
+- README: a numbered global-install procedure (`uv tool install .`, PATH check, config
+  file, verification, update, uninstall), a "Permissions in agent mode" section with
+  ready-to-copy `.env` configurations and the rule syntax, and an explanation of how the
+  gateway's policy layers on Kiro's own `permissions.yaml` in agent and harness mode.
+
+### Changed
+
+- Agent-mode callers (scripts, curl, the SDKs) are now shown naming their own project
+  with `X-Kiro-Workspace`, and the gateway examples start with
+  `KIRO_GATEWAY_ALLOWED_WORKSPACES` plus a scratch fallback workspace instead of the
+  gateway's checkout. All client examples send the header; the CLI's `--cwd` is
+  documented. Harness clients are unaffected.
+- The README start example and `.env.example` use `KIRO_GATEWAY_PERMISSIONS=allow-always`
+  and explain what `deny` actually does.
+- The `legacy/` proof-of-concept scripts were removed; they remain in the git history.
+
 ## [0.1.0] - 2026-09-17
 
 First release. Verified against Kiro CLI 2.22 on macOS with Claude Code, Codex CLI,
@@ -45,4 +75,5 @@ OpenCode, Collomia, the OpenAI and Anthropic Python SDKs, curl, and plain `reque
   themes, an audit ledger with secret redaction, health endpoint, Docker/Podman image,
   launchd and systemd installers, GitHub Actions CI, and ready-to-use client examples.
 
+[0.1.1]: https://github.com/robert-mcdermott/kiro-acp-gateway/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/robert-mcdermott/kiro-acp-gateway/releases/tag/v0.1.0
