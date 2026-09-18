@@ -268,9 +268,16 @@ Every option has an environment default: `KIRO_ACP_CLI`, `KIRO_ACP_ENGINE`,
 export KIRO_GATEWAY_ALLOWED_WORKSPACES="$HOME/code/*"   # directories agent-mode requests may select
 export KIRO_GATEWAY_WORKSPACE="$HOME/code/scratch"       # fallback for requests that name no directory
 export KIRO_GATEWAY_API_KEY="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export KIRO_GATEWAY_PERMISSIONS=deny                     # deny | allow-once | allow-always | allow-all
+export KIRO_GATEWAY_PERMISSIONS=allow-always             # what Kiro's own tools may do in agent mode (see below)
 uv run kiro-gateway --port 8000
 ```
+
+`KIRO_GATEWAY_PERMISSIONS` only concerns agent-mode turns (scripts and curl without
+tools), where Kiro runs its own tools and asks the gateway for permission. `allow-always`
+is right for a gateway on your own machine; `deny` (the built-in default) refuses every
+request, which leaves Kiro able to read but not to run commands or write, so use it only
+as the base for `KIRO_GATEWAY_PERMISSION_RULES` or for a gateway other people can reach.
+Coding harnesses are unaffected either way: they run their tools themselves and ask you.
 
 > **Which directory does Kiro work in?** Coding harnesses (Claude Code, Codex, OpenCode)
 > run their tools themselves, in the directory they were started in; the gateway never
@@ -624,6 +631,55 @@ A script that wants Kiro's own agentic behaviour must therefore send no `tools`.
 passes tools for some other reason (an SDK helper that always attaches them, for
 example), set `KIRO_GATEWAY_TOOL_MODE=ignore` to drop them and force agent mode, or
 `reject` to fail such requests with a 400. Each turn logs which mode and engine it ran on.
+
+### Permissions in agent mode
+
+When a request carries no tools, Kiro runs its own tools and asks the gateway before
+writing files, running commands, fetching URLs, or calling MCP tools. Two settings decide
+the answer; both use the same vocabulary as the CLI's `--permissions` and `--allow` /
+`--deny` flags (see *Permissions* under the `kiro-acp` utility for the selector details):
+
+- `KIRO_GATEWAY_PERMISSIONS` is the policy: `deny`, `allow-once`, `allow-always`, or
+  `allow-all`. There is no interactive `ask` for a server.
+- `KIRO_GATEWAY_PERMISSION_RULES` is an ordered list of `allow:` / `deny:` rules,
+  separated by `;` (or `,` when no rule contains one), checked before the policy. The
+  first matching rule wins; the policy answers whatever no rule matched.
+
+Typical configurations for the `.env` file:
+
+```bash
+# Your own machine: let Kiro work
+KIRO_GATEWAY_PERMISSIONS=allow-always
+
+# Read-only analysis for pipeline scripts: reads, searches and fetches only
+KIRO_GATEWAY_PERMISSIONS=deny
+KIRO_GATEWAY_PERMISSION_RULES=allow:kind=read,search,fetch
+
+# Development helper: reads, plus a few known-safe commands, nothing else
+KIRO_GATEWAY_PERMISSIONS=deny
+KIRO_GATEWAY_PERMISSION_RULES=allow:kind=read,search;allow:Bash(git status*);allow:Bash(git diff*);allow:Bash(uv run pytest*)
+
+# Everything except a few paths and destructive commands
+KIRO_GATEWAY_PERMISSIONS=allow-always
+KIRO_GATEWAY_PERMISSION_RULES=deny:Read(~/.ssh/*);deny:Read(**/.env);deny:Bash(rm -rf*);deny:Bash(git push*)
+```
+
+Selectors: `kind=` matches the ACP tool kind (`read`, `edit`, `delete`, `move`, `search`,
+`execute`, `fetch`, `think`, `other`), `tool=` the Kiro tool name and `title=` the human
+title (both shell globs), and the Claude Code forms `Bash(pattern)`, `Read(path glob)`,
+`Edit(path glob)`, `mcp__server__tool` match the command or path Kiro is asking about.
+
+A denied request is not an error: Kiro is told the tool was refused and answers with what
+it could still do, and the decision is recorded in the audit ledger. Per request, a
+client may switch policies with `X-Kiro-Permissions` or `kiro.permissions` only when
+`KIRO_GATEWAY_ALLOW_PERMISSION_OVERRIDE=true`.
+
+These settings sit on top of Kiro's own policy (`~/.kiro/settings/permissions.yaml` on
+the v3 engine): Kiro's `deny` entries never reach the gateway, its `allow` entries never
+ask, and only its `ask` entries are decided here, so the gateway can narrow Kiro's policy
+but not widen it. `KIRO_GATEWAY_HARNESS_PERMISSIONS` is the same policy for harness turns
+and almost never matters: the harness agent has no tools of its own, and the bridged
+client tools are allowed by a built-in rule while the harness asks its user.
 
 ### Kiro agents the gateway installs
 
