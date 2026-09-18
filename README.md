@@ -3,6 +3,9 @@
 Use the [Kiro CLI](https://kiro.dev) coding agent from scripts, custom automations, and
 other coding harnesses.
 
+![kiro-acp-dashboard](docs/kiro-acp-gateway.png)
+
+
 The project has three layers, all built on the
 [Agent Client Protocol (ACP)](https://agentclientprotocol.com) that `kiro-cli acp` speaks:
 
